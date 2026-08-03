@@ -124,45 +124,81 @@ function deleteSyncState(accountId: string): void {
   }
 }
 
-// ── Persistent Session Storage (per-account) ───────────────────────────
+// ── Per-user Session Map (multi-session routing) ───────────────────────
 
-const SESSION_FILE = "last-session.json";
+const SESSION_MAP_FILE = "sessions.json";
+const LEGACY_SESSION_SUFFIX = "-last-session.json";
 
-function sessionFilePath(accountId: string): string {
-  return path.join(getStateDir(), `${safeId(accountId)}-${SESSION_FILE}`);
+function sessionMapPath(accountId: string): string {
+  return path.join(getStateDir(), `${safeId(accountId)}-${SESSION_MAP_FILE}`);
 }
 
-/** Load the last-known Pi session file path for an account, or null. */
-export function loadSavedSession(accountId: string): string | null {
-  try {
-    const filePath = sessionFilePath(accountId);
-    if (!fs.existsSync(filePath)) return null;
-    const raw = fs.readFileSync(filePath, "utf-8").trim();
-    return raw || null;
-  } catch {
-    return null;
-  }
+function legacySessionPath(accountId: string): string {
+  return path.join(getStateDir(), `${safeId(accountId)}${LEGACY_SESSION_SUFFIX}`);
 }
 
-/** Save the Pi session file path for an account (for resume after restart). */
-export function saveSavedSession(accountId: string, sessionPath: string): void {
-  try {
-    const filePath = sessionFilePath(accountId);
-    ensureDir(path.dirname(filePath));
-    fs.writeFileSync(filePath, sessionPath, "utf-8");
-  } catch {
-    // ignore
-  }
+function saveSessionMap(accountId: string, map: Record<string, string>): void {
+  const filePath = sessionMapPath(accountId);
+  ensureDir(path.dirname(filePath));
+  fs.writeFileSync(filePath, JSON.stringify(map, null, 2), "utf-8");
 }
 
-/** Clear the saved Pi session file path for an account. */
-export function clearSavedSession(accountId: string): void {
+/**
+ * Load the per-user session map for an account.
+ *
+ * Session keys: "" = default/private session; otherwise a from_user_id
+ * (per-sender session for group messages).
+ *
+ * Migrates the Phase 1 legacy `<account>-last-session.json` file into the
+ * map under the default key ("/") on first load, then removes it.
+ */
+export function loadSessionMap(accountId: string): Record<string, string> {
+  let map: Record<string, string> = {};
   try {
-    const filePath = sessionFilePath(accountId);
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    const mapPath = sessionMapPath(accountId);
+    if (fs.existsSync(mapPath)) {
+      const parsed = JSON.parse(fs.readFileSync(mapPath, "utf-8"));
+      if (parsed && typeof parsed === "object") {
+        map = { ...(parsed as Record<string, string>) };
+      }
+    }
   } catch {
-    // ignore
+    map = {};
   }
+
+  // Migration: legacy single-session file → default (private) session key.
+  try {
+    const legacyPath = legacySessionPath(accountId);
+    if (fs.existsSync(legacyPath)) {
+      const legacy = fs.readFileSync(legacyPath, "utf-8").trim();
+      if (legacy && !map[""]) {
+        map[""] = legacy;
+        saveSessionMap(accountId, map);
+      }
+      fs.unlinkSync(legacyPath);
+    }
+  } catch {
+    // ignore migration errors
+  }
+
+  return map;
+}
+
+/** Load one session key's saved session path ("" = default/private). */
+export function loadUserSession(accountId: string, sessionKey: string): string | null {
+  const map = loadSessionMap(accountId);
+  return map[sessionKey] ?? null;
+}
+
+/** Save one session key's session path ("" = default/private). */
+export function saveUserSession(
+  accountId: string,
+  sessionKey: string,
+  sessionPath: string,
+): void {
+  const map = loadSessionMap(accountId);
+  map[sessionKey] = sessionPath;
+  saveSessionMap(accountId, map);
 }
 
 // ── Context Token Storage (per-account, per-user) ──────────────────────

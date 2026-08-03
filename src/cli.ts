@@ -42,6 +42,7 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   defaultModel       默认模型 ("provider/modelId" 或模型名，空=使用 Pi 默认)
   allowlist          允许的用户 ID，逗号分隔（空=允许所有）
   groupChat          群聊模式 (true/false)
+  botName            群聊 @ 触发昵称 (如 "mybot"，空=处理所有群消息)
   maxReplyLength     单条回复最大字符数 (0=不拆分)
   replyPrefix        AI 回复前缀 (如 "🤖 ")
   logLevel           日志级别 (debug/info/warn/error)

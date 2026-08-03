@@ -33,7 +33,7 @@ import os from "node:os";
 import { WeixinApi } from "./api.js";
 import { Poller, type MessageCallback, type LogCallback } from "./poller.js";
 import { RpcClient, setRpcLogLevel } from "./rpc-client.js";
-import { loadAccounts, saveContextToken, loadContextTokens, loadSavedSession, saveSavedSession } from "./storage.js";
+import { loadAccounts, saveContextToken, loadContextTokens, loadUserSession, saveUserSession } from "./storage.js";
 import { loadConfig } from "./config.js";
 import { Logger, resolveLogLevel } from "./logger.js";
 import { formatAndSplit } from "./format-reply.js";
@@ -53,6 +53,8 @@ interface PendingContext {
   userId: string;
   contextToken: string;
   sessionId: string;
+  /** Session routing key ("" = default/private, otherwise a from_user_id). */
+  sessionKey: string;
 }
 
 // ── Message Queue Entry ────────────────────────────────────────────────
@@ -62,6 +64,8 @@ interface QueuedMessage {
   userId: string;
   contextToken: string;
   sessionId: string;
+  /** Session routing key ("" = default/private, otherwise a from_user_id). */
+  sessionKey: string;
   text: string;
   /** Optional image item from the WeChat message. */
   imageItem?: ImageItem;
@@ -246,32 +250,56 @@ async function runDaemon(): Promise<void> {
     }
   }
 
+  // ── Multi-session routing state ──────────────────────────────────────
+
   /**
-   * Resume the most recently modified Pi session file across accounts
-   * (the daemon shares a single RPC process, so only one is restored).
+   * Session key of the session currently active in the shared RPC process.
+   * "" = default/private session; otherwise a from_user_id (group sender).
+   * Reset to null when the RPC process restarts (it holds a fresh session).
    */
-  async function resumePersistedSession(client: RpcClient): Promise<void> {
-    if (!config.persistentSession) return;
-    let best: { accountId: string; path: string; mtime: number } | null = null;
-    for (const account of accounts) {
-      const saved = loadSavedSession(account.id);
-      if (!saved || !fs.existsSync(saved)) continue;
-      try {
-        const mtime = fs.statSync(saved).mtimeMs;
-        if (!best || mtime > best.mtime) {
-          best = { accountId: account.id, path: saved, mtime };
-        }
-      } catch {
-        /* unreadable file — skip */
+  let sessionOwnerKey: string | null = null;
+
+  /**
+   * Switch the shared RPC process to the session belonging to `sessionKey`
+   * ("" = default/private). Must be called while Pi is idle.
+   * Creates a fresh session for the key if none is saved.
+   */
+  async function ensureSessionFor(account: WeixinAccount, sessionKey: string): Promise<void> {
+    if (!rpcClient) return;
+    if (sessionOwnerKey === sessionKey) return;
+    const label = sessionKey === "" ? "默认" : sessionKey.slice(0, 12);
+    const saved = loadUserSession(account.id, sessionKey);
+    try {
+      if (saved && fs.existsSync(saved)) {
+        await rpcClient.switchSession(saved);
+        log(`[rpc] 会话已切换到 (${label}): ${saved}`);
+      } else {
+        await rpcClient.newSession();
+        log(`[rpc] 为 (${label}) 创建新会话`);
       }
+      sessionOwnerKey = sessionKey;
+    } catch (err) {
+      logWarn(`[rpc] 切换会话失败 (${label}): ${err instanceof Error ? err.message : String(err)}`);
+      // Claim ownership optimistically so the turn proceeds; the session
+      // path is re-saved on agent_end regardless.
+      sessionOwnerKey = sessionKey;
     }
-    if (best) {
-      try {
-        await client.switchSession(best.path);
-        log(`[rpc] 已恢复 ${best.accountId} 的持久会话: ${best.path}`);
-      } catch (err) {
-        logWarn(`[rpc] 恢复会话失败 (${best.accountId}): ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  /**
+   * Persist the RPC process's current session file under a session key.
+   * Called after session-changing commands (/new, /resume, /fork, /clone)
+   * so a later user switch resolves to the new file, not the stale one.
+   */
+  async function persistCurrentSession(accountId: string, sessionKey: string): Promise<void> {
+    if (!config.persistentSession || !rpcClient) return;
+    try {
+      const state = (await rpcClient.getState()) as { sessionFile?: string } | null;
+      if (state?.sessionFile) {
+        saveUserSession(accountId, sessionKey, state.sessionFile);
       }
+    } catch {
+      /* best effort */
     }
   }
 
@@ -538,6 +566,7 @@ async function runDaemon(): Promise<void> {
     userId: string,
     contextToken: string,
     sessionId: string,
+    sessionKey: string,
   ): Promise<void> {
     if (!rpcClient) return;
 
@@ -548,6 +577,7 @@ async function runDaemon(): Promise<void> {
           const cancelled = result?.cancelled;
           await sendWeixinReply(api, account, userId, contextToken, sessionId,
             cancelled ? "⚠️ 新建 session 被取消" : "✅ 已新建 session");
+          if (!cancelled) await persistCurrentSession(account.id, sessionKey);
           log(`[slash] /new (user=${userId})`);
           break;
         }
@@ -621,6 +651,7 @@ async function runDaemon(): Promise<void> {
           const cancelled = result?.cancelled;
           await sendWeixinReply(api, account, userId, contextToken, sessionId,
             cancelled ? "⚠️ 克隆被取消" : "✅ 已克隆当前 session");
+          if (!cancelled) await persistCurrentSession(account.id, sessionKey);
           log(`[slash] /clone (user=${userId})`);
           break;
         }
@@ -716,6 +747,33 @@ async function runDaemon(): Promise<void> {
         }
 
         case "model": {
+          // Direct switch: /model <name-or-id>
+          if (cmd.args) {
+            const result = (await rpcClient.getAvailableModels()) as Record<string, unknown> | null;
+            const models = result?.models as unknown[] | undefined;
+            const q = cmd.args.trim().toLowerCase();
+            const found = (models ?? []).find((m: unknown) => {
+              const item = m as Record<string, unknown>;
+              const id = (item.id ?? item.modelId ?? "") as string;
+              const name = (item.name ?? "") as string;
+              return name.toLowerCase().includes(q) || id.toLowerCase().includes(q);
+            }) as Record<string, unknown> | undefined;
+            if (!found) {
+              await sendWeixinReply(api, account, userId, contextToken, sessionId,
+                `⚠️ 未找到匹配模型: ${cmd.args}`);
+              return;
+            }
+            await rpcClient.setModel(
+              (found.provider as string) ?? "",
+              (found.id ?? found.modelId) as string,
+            );
+            invalidateVisionCache();
+            await sendWeixinReply(api, account, userId, contextToken, sessionId,
+              `✅ 已切换模型: ${(found.name ?? found.id) as string}`);
+            log(`[slash] /model ${cmd.args} → ${(found.id ?? found.modelId) as string} (user=${userId})`);
+            return;
+          }
+
           const result = (await rpcClient.getAvailableModels()) as Record<string, unknown> | null;
           const models = result?.models as unknown[] | undefined;
           if (!models || models.length === 0) {
@@ -734,6 +792,62 @@ async function runDaemon(): Promise<void> {
           lines.push("", "回复数字编号切换模型");
           await sendWeixinReply(api, account, userId, contextToken, sessionId, lines.join("\n"));
           log(`[slash] /model → ${models.length} 个模型 (user=${userId})`);
+          break;
+        }
+
+        case "status": {
+          const [state, stats] = await Promise.all([
+            rpcClient.getState(),
+            rpcClient.getSessionStats().catch(() => null),
+          ]);
+          const formatted = formatSessionState(state, stats);
+          const queueInfo = `\n\n📬 待处理消息: ${messageQueue.length}` +
+            (sessionOwnerKey !== null
+              ? ` | 当前会话: ${sessionOwnerKey === "" ? "默认" : sessionOwnerKey.slice(0, 12)}`
+              : "");
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, formatted + queueInfo);
+          log(`[slash] /status (user=${userId})`);
+          break;
+        }
+
+        case "image": {
+          const url = cmd.args.trim();
+          if (!url) {
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, "⚠️ 用法: /image <图片URL>");
+            return;
+          }
+          if (rpcClient.isStreaming || processingWeixin) {
+            messageQueue.push({ account, userId, contextToken, sessionId, sessionKey, text: `/image ${url}` });
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, "⏳ 当前任务进行中，图片分析已排队");
+            return;
+          }
+          const fakeImageItem = { media: { full_url: url } } as ImageItem;
+          void injectMessage({
+            account, userId, contextToken, sessionId, sessionKey,
+            text: "", imageItem: fakeImageItem,
+          }).catch((err) => log(`[slash] /image 注入失败: ${err instanceof Error ? err.message : String(err)}`));
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, "🖼️ 正在分析图片，请稍候...");
+          log(`[slash] /image ${url.slice(0, 60)} (user=${userId})`);
+          break;
+        }
+
+        case "search": {
+          const query = cmd.args.trim();
+          if (!query) {
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, "⚠️ 用法: /search <关键词>");
+            return;
+          }
+          const text = `请联网搜索并总结：${query}\n\n【要求】使用可用的搜索工具/技能查找最新信息，用中文总结要点，并注明来源。`;
+          if (rpcClient.isStreaming || processingWeixin) {
+            messageQueue.push({ account, userId, contextToken, sessionId, sessionKey, text });
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, "⏳ 当前任务进行中，搜索已排队");
+          } else {
+            void injectMessage({
+              account, userId, contextToken, sessionId, sessionKey, text,
+            }).catch((err) => log(`[slash] /search 注入失败: ${err instanceof Error ? err.message : String(err)}`));
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, `🔍 已开始搜索：${query}`);
+          }
+          log(`[slash] /search ${query.slice(0, 40)} (user=${userId})`);
           break;
         }
 
@@ -780,11 +894,14 @@ async function runDaemon(): Promise<void> {
             "/compact [instructions] — 压缩上下文",
             "/abort — 中止当前任务",
             "/session — 查看 session 状态",
+            "/status — 查看会话状态 + 队列信息",
             "/messages — 查看对话消息",
             "/export [path] — 导出 session 为 HTML",
             "/resume — 恢复历史 session",
-            "/model — 切换模型",
+            "/model [name] — 切换模型（带参数直接切换，无参数列出）",
             "/cycle-model — 轮播模型",
+            "/image <url> — 分析一张网络图片",
+            "/search <query> — 联网搜索并总结",
             "/thinking [level] — 设置/切换 thinking level",
             "/steer-mode <mode> — 设置 steering 模式",
             "/follow-mode <mode> — 设置 follow-up 模式",
@@ -843,6 +960,7 @@ async function runDaemon(): Promise<void> {
     userId: string,
     contextToken: string,
     sessionId: string,
+    sessionKey: string,
   ): Promise<void> {
     if (!rpcClient) return;
 
@@ -921,6 +1039,20 @@ async function runDaemon(): Promise<void> {
       return;
     }
 
+    // ── Session routing key ─────────────────────────────────────────
+    // Private messages share the default session (""); group messages
+    // (when enabled) use a per-sender session keyed by from_user_id,
+    // gated on @<botName> mentions when botName is configured.
+    let sessionKey = "";
+    if (msg.group_id) {
+      const botName = (config.botName ?? "").trim();
+      if (botName && !text.includes(`@${botName}`)) {
+        logDebug(`[weixin] 群聊消息未 @${botName}，忽略 (group=${msg.group_id})`);
+        return;
+      }
+      sessionKey = userId;
+    }
+
     // Save context token for this user (must echo verbatim in replies)
     if (userId && contextToken) {
       saveContextToken(account.id, userId, contextToken);
@@ -994,6 +1126,7 @@ async function runDaemon(): Promise<void> {
                 api, account, userId, latestToken, sessionId,
                 `✅ 已恢复 session: ${session.label}`,
               );
+              await persistCurrentSession(account.id, sessionKey);
             }
             log(`[slash] session 已切换: ${session.path} (user=${userId})`);
           } catch (err) {
@@ -1031,6 +1164,7 @@ async function runDaemon(): Promise<void> {
                 api, account, userId, latestToken, sessionId,
                 `✅ 已从消息 fork\n原文: ${preview || "(空)"}`,
               );
+              await persistCurrentSession(account.id, sessionKey);
             }
             log(`[slash] fork 完成: ${forkMsg.entryId} (user=${userId})`);
           } catch (err) {
@@ -1051,20 +1185,32 @@ async function runDaemon(): Promise<void> {
     // ── Slash command detection ───────────────────────────────────────
     const slashResult = parseSlashCommand(text);
     if (slashResult) {
-      void handleSlashCommand(slashResult, account, userId, latestToken, sessionId);
+      void handleSlashCommand(slashResult, account, userId, latestToken, sessionId, sessionKey);
       return;
     }
 
     // ── Bash command detection (! / !!) ───────────────────────────────
     const bashResult = parseBashCommand(text);
     if (bashResult) {
-      void handleBashCommand(bashResult, account, userId, latestToken, sessionId);
+      void handleBashCommand(bashResult, account, userId, latestToken, sessionId, sessionKey);
       return;
     }
 
     // ── Route by state machine ─────────────────────────────────────────
     if (sm.isWaitingUIResponse) {
       const uiReq = sm.pendingUIRequest!;
+
+      // Only the user whose turn is waiting may answer the dialog;
+      // other users' messages are queued until the turn completes.
+      if (pendingContext && userId !== pendingContext.userId) {
+        logDebug(`[weixin] 用户 ${userId} 的消息在 UI 等待期间被排队`);
+        messageQueue.push({
+          account, userId, contextToken: latestToken, sessionId, sessionKey,
+          text, imageItem, fileItem, voiceItem, videoItem,
+        });
+        return;
+      }
+
       log(`[weixin] 当前状态=WAITING_UI_RESPONSE (${uiReq.method}), 解释为 UI 回复`);
 
       // Parse the user's response into an extension_ui_response payload
@@ -1092,6 +1238,7 @@ async function runDaemon(): Promise<void> {
         userId,
         contextToken: latestToken,
         sessionId,
+        sessionKey,
         text,
         imageItem,
         fileItem,
@@ -1106,6 +1253,7 @@ async function runDaemon(): Promise<void> {
         userId,
         contextToken: latestToken,
         sessionId,
+        sessionKey,
         text,
         imageItem,
         fileItem,
@@ -1131,7 +1279,15 @@ async function runDaemon(): Promise<void> {
       userId: qm.userId,
       contextToken: qm.contextToken,
       sessionId: qm.sessionId,
+      sessionKey: qm.sessionKey,
     };
+
+    // ── Ensure the correct per-user session is active before prompting ──
+    try {
+      await ensureSessionFor(qm.account, qm.sessionKey);
+    } catch (err) {
+      logWarn(`[weixin] 会话切换异常: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     let messageText = qm.text;
     let imagePath: string | null = null;
@@ -1262,6 +1418,15 @@ async function runDaemon(): Promise<void> {
 
     // Ensure message is not empty
     if (!messageText.trim()) {
+      // Image-only message whose download failed and no other content:
+      // nothing meaningful to send to Pi — abort this turn quietly.
+      if (qm.imageItem && !imagePath && !filePath && !voicePath && !videoPath) {
+        log("[weixin] 图片下载失败且无其他内容，跳过本次处理");
+        pendingContext = null;
+        processingWeixin = false;
+        flushQueue();
+        return;
+      }
       messageText = imagePath ? "[图片]" : filePath ? "[文件]" : voicePath ? "[语音]" : videoPath ? "[视频]" : "[空消息]";
     }
 
@@ -1356,18 +1521,8 @@ async function runDaemon(): Promise<void> {
           ).catch(() => {});
         }
 
-        // ── Persist the session file path (for resume after restart) ──
-        if (config.persistentSession && rpcClient) {
-          void rpcClient
-            .getState()
-            .then((state) => {
-              const sessionFile = (state as { sessionFile?: string } | null)?.sessionFile;
-              if (sessionFile) saveSavedSession(ctx.account.id, sessionFile);
-            })
-            .catch(() => {
-              /* best effort */
-            });
-        }
+        // ── Persist the session file path (per-user map, for resume) ──
+        await persistCurrentSession(ctx.account.id, ctx.sessionKey);
 
         processingWeixin = false;
       } else if (reply) {
@@ -1564,9 +1719,9 @@ async function runDaemon(): Promise<void> {
         rpcClient = newClient;
         bindRpcEvents(newClient);
 
-        // Re-apply default model + restore persisted session after reconnect
+        // Re-apply default model after reconnect
         await applyDefaultModel(newClient);
-        await resumePersistedSession(newClient);
+        sessionOwnerKey = null; // fresh RPC process → fresh session
 
         log(
           `[rpc] 重连成功 (PID: ${(newClient as any).proc?.pid ?? "unknown"})`,
@@ -1613,9 +1768,8 @@ async function runDaemon(): Promise<void> {
     rpcClient = initialClient;
     bindRpcEvents(initialClient);
 
-    // ── Apply default model + restore persisted session ─────────────
+    // ── Apply default model ────────────────────────────────────────
     await applyDefaultModel(initialClient);
-    await resumePersistedSession(initialClient);
 
     log(
       `Pi RPC 子进程已启动 (PID: ${(initialClient as any).proc?.pid ?? "unknown"})`,

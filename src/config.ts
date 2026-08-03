@@ -27,6 +27,8 @@ export interface WeixinConfig {
   allowlist?: string[];
   /** 是否处理群聊消息。 */
   groupChat?: boolean;
+  /** 机器人昵称（群聊 @ 触发用）；空 = 处理所有群消息。 */
+  botName?: string;
   /** 单条回复最大字符数；0 = 不拆分。默认 2000。 */
   maxReplyLength?: number;
   /** 发送给用户的 AI 回复前缀（emoji 状态前缀）。默认 "🤖 "。 */
@@ -48,6 +50,7 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   defaultModel: undefined,
   allowlist: [],
   groupChat: false,
+  botName: "",
   maxReplyLength: 2000,
   replyPrefix: "🤖 ",
   logLevel: "info",
@@ -122,6 +125,10 @@ export function setConfigValue(
       return null;
     }
 
+    case "botName":
+      config.botName = rawValue.trim();
+      return null;
+
     case "maxReplyLength": {
       const n = parseInt(rawValue, 10);
       if (isNaN(n) || n < 0) return `maxReplyLength 必须是 >= 0 的数字（0=不拆分）`;
@@ -165,6 +172,7 @@ export function describeConfig(config: WeixinConfig): string {
       : "(允许所有用户)",
   );
   label("groupChat", config.groupChat ? "启用" : "禁用（忽略群消息）");
+  label("botName", config.botName ? `@${config.botName} 触发` : "(处理所有群消息)");
   label("maxReplyLength", config.maxReplyLength === 0 ? "(不拆分)" : `${config.maxReplyLength} 字符`);
   label("replyPrefix", JSON.stringify(config.replyPrefix ?? ""));
   label("logLevel", config.logLevel ?? "info");

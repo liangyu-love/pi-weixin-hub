@@ -151,8 +151,11 @@ Weixin Backend (ilinkai.weixin.qq.com)
 | `/session` | 显示当前 session 状态（模型、token 等） |
 | `/messages` | 查看最近 20 条对话消息 |
 | `/export [path]` | 导出 session 为 HTML |
-| `/model` | 切换模型（回复编号选择） |
+| `/model [name]` | 切换模型：带参数直接按名称/ID 切换，无参数列出可选模型 |
 | `/cycle-model` | 轮播到下一个可用模型 |
+| `/image <url>` | 分析一张网络图片（自动走视觉模型或 vision 子代理） |
+| `/search <query>` | 联网搜索并总结（要求模型使用搜索工具/技能） |
+| `/status` | 查看会话状态 + 队列与当前会话信息 |
 | `/thinking [level]` | 设置（off/minimal/low/medium/high/xhigh）或轮播 thinking level |
 | `/steer-mode <mode>` | 设置 steering 消息队列模式（all / one-at-a-time） |
 | `/follow-mode <mode>` | 设置 follow-up 消息队列模式（all / one-at-a-time） |
@@ -167,6 +170,21 @@ Weixin Backend (ilinkai.weixin.qq.com)
 | `/help` | 显示可用命令列表 |
 
 > **通用转发**：Pi 扩展命令（如 `/skill:xxx`、prompt template）无需在 pi-weixin-cli 中注册，直接发送即可自动转发给 Pi 处理。
+
+## 多会话路由（Multi-Session）
+
+pi-weixin-hub 按消息来源隔离 Pi 的对话上下文：
+
+| 消息来源 | 会话行为 |
+|---------|---------|
+| 私聊 | 使用**默认会话**（所有私聊共享，保持原有行为） |
+| 群聊（`groupChat` 开启） | 每个**发送者**拥有独立会话（按 `from_user_id` 映射） |
+| 群聊 @ 提及 | 配置 `botName` 后，仅包含 `@botName` 的群消息会被处理 |
+
+- 会话切换在 Pi 空闲时进行（`switch_session` 或为新用户 `new_session`），忙碌时的消息自动排队
+- 每个用户的会话文件持久化在 `~/.config/pi-weixin-cli/<账号>-sessions.json`（重启后自动恢复各自上下文）
+- UI 交互（select/confirm/input）只接受**当前会话所有者**的回复，其他用户的消息排队等待
+- 旧版 `<账号>-last-session.json` 会自动迁移到默认会话键
 
 ## 交互支持（UI Bridge）
 
@@ -292,6 +310,7 @@ pi-weixin-cli 支持接收微信视频消息：
 | `defaultModel` | string | `""` | 启动时切换到的默认模型（`provider/modelId` 或模型名） |
 | `allowlist` | string[] | `[]` | 允许使用 bot 的用户 ID 列表；空 = 允许所有用户 |
 | `groupChat` | boolean | `false` | 是否响应群聊消息 |
+| `botName` | string | `""` | 群聊触发昵称（消息需含 `@botName`；空 = 处理所有群消息） |
 | `maxReplyLength` | number | `2000` | 单条回复最大字符数，超过自动拆分（`0` = 不拆分） |
 | `replyPrefix` | string | `"🤖 "` | AI 回复的 emoji 状态前缀 |
 | `logLevel` | string | `"info"` | 日志级别：`debug` / `info` / `warn` / `error` |
@@ -321,7 +340,8 @@ pi-weixin-cli 支持接收微信视频消息：
 
 - **纯文本回复**：Pi 的回复经格式化（代码块、列表、长文本拆分）后以纯文本发送，不支持 Markdown 渲染
 - **单会话处理**：消息按 FIFO 顺序逐条处理，Pi 同一时间只处理一条微信消息
-- **无会话隔离**：所有微信消息注入同一个 Pi RPC 会话（多用户会话隔离见开发计划 Phase 2）
+- **单 RPC 会话**：多个账号共享同一个 Pi RPC 进程（同一时刻只能激活一个会话文件），多账号间上下文不隔离
+- **群聊消息仅在 @ 提及或群聊模式开启时处理**：避免 bot 被群消息刷屏
 - **需要常驻终端**：daemon 模式在前台运行（非 systemd service），关闭终端即停止
 - **bash 结果延迟可见**：`!command` 的结果在 Pi 内部静默存储，需**下一次用户消息**触发后 AI 才能看到（RPC 协议设计）
 
