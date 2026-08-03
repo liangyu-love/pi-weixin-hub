@@ -811,18 +811,29 @@ async function runDaemon(): Promise<void> {
 
         case "abort": {
           pendingAbort = true;
-          rpcClient.sendAbort();
-          await sendWeixinReply(api, account, userId, contextToken, sessionId, "✅ 已中止当前任务");
-          // Fallback: pi may not emit agent_end after an abort in some
-          // states — force a clean turn reset if nothing arrives.
+          // Schedule the fallback BEFORE any awaits: agent_end's finalize
+          // clears this timer, so it only fires if pi never responds to
+          // the abort (avoiding the race where a late-set timer would
+          // fire during the NEXT turn and mislabel it as aborted).
           if (turnAbortTimer) clearTimeout(turnAbortTimer);
           turnAbortTimer = setTimeout(() => {
             turnAbortTimer = null;
-            if (!turnData && processingWeixin) {
-              turnData = { messages: [], aborted: true };
+            // Nudge pi to actually stop, then force a clean turn reset.
+            try {
+              rpcClient?.sendAbort();
+            } catch {
+              /* ignore */
             }
-            if (turnData) void finalizeTurn();
+            if (turnData) {
+              turnData = { ...turnData, aborted: true };
+              void finalizeTurn();
+            } else if (processingWeixin) {
+              turnData = { messages: [], aborted: true };
+              void finalizeTurn();
+            }
           }, 15_000);
+          rpcClient.sendAbort();
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, "✅ 已中止当前任务");
           log(`[slash] /abort (user=${userId})`);
           break;
         }
@@ -1775,7 +1786,7 @@ async function runDaemon(): Promise<void> {
     // Append file path to message text if present
     if (filePath) {
       const fileName = qm.fileItem?.file_name ?? "unknown";
-      messageText += `\n\n[用户发送了一个文件：${fileName}]\n📄 ${filePath}`;
+      messageText += `\n\n[用户发送了一个文件：${fileName}]\n📄 ${filePath}\n（如需读取该文件内容，请调用 convert_document 工具转换）`;
     }
 
     // ── Voice processing (save locally, give path + transcript to Pi) ─
@@ -2081,6 +2092,7 @@ async function runDaemon(): Promise<void> {
   async function finalizeTurn(): Promise<void> {
     if (!turnData) return;
     const aborted = pendingAbort || turnData.aborted;
+    const wasUserAbort = pendingAbort;
     pendingAbort = false;
     const { messages } = turnData;
     turnData = null;
@@ -2111,11 +2123,17 @@ async function runDaemon(): Promise<void> {
       sendTypingStatus(ctx.account, ctx.userId, ctx.contextToken, 2);
 
       if (aborted) {
-        // Intentional abort (user /abort or Pi aborted) — no error prompt
-        await sendWeixinReply(
-          api, ctx.account, ctx.userId, ctx.contextToken, ctx.sessionId,
-          "⏹️ 已中止当前任务",
-        ).catch(() => {});
+        if (wasUserAbort) {
+          // The /abort command already acknowledged with ✅ — sending a
+          // second ⏹️ here would duplicate the confirmation.
+          log("[rpc] 回合已按用户中止处理");
+        } else {
+          // Pi aborted on its own (no /abort) — inform the user.
+          await sendWeixinReply(
+            api, ctx.account, ctx.userId, ctx.contextToken, ctx.sessionId,
+            "⏹️ 已中止当前任务",
+          ).catch(() => {});
+        }
       } else if (reply) {
         // ── Format + split long replies, apply status prefix ────────
         const chunks = formatAndSplit(reply, config.maxReplyLength ?? 2000);
