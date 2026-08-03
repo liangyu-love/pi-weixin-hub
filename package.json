@@ -29,7 +29,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Guanzhw/pi-weixin-cli.git"
+    "url": "git+https://github.com/liangyu-love/pi-weixin-hub.git"
   },
   "license": "MIT",
   "dependencies": {

@@ -34,7 +34,7 @@ npm update -g pi-weixin-cli
 ### 方式二：从源码安装（开发或自定义）
 
 ```bash
-git clone https://github.com/Guanzhw/pi-weixin-cli.git
+git clone https://github.com/liangyu-love/pi-weixin-hub.git
 cd pi-weixin-cli
 npm install
 npm run build
