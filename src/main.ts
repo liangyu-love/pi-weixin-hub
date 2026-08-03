@@ -2576,7 +2576,7 @@ async function runDaemon(): Promise<void> {
 
   // ── Webhook API (Pi extensions / scripts can push messages) ──────────
 
-  /** Resolve the target routing context for a webhook push. */
+  /** Resolve the target routing context for a webhook/scheduler push. */
   function resolveWebhookTarget(user: string): PendingContext | null {
     if (user) {
       // Explicit user: look up their saved context token on any account
@@ -2588,7 +2588,24 @@ async function runDaemon(): Promise<void> {
       }
       return null;
     }
-    return lastSenderGlobal ?? (lastSenders.size > 0 ? lastSenders.values().next().value as PendingContext : null);
+    // Default: most recent in-memory sender, else any stored user token
+    // (so scheduled pushes work right after a daemon restart).
+    if (lastSenderGlobal) return lastSenderGlobal;
+    if (lastSenders.size > 0) return lastSenders.values().next().value as PendingContext;
+    for (const account of accounts) {
+      const tokens = loadContextTokens(account.id);
+      const entries = Object.entries(tokens);
+      if (entries.length > 0) {
+        return {
+          account,
+          userId: entries[0][0],
+          contextToken: entries[0][1],
+          sessionId: "",
+          sessionKey: "",
+        };
+      }
+    }
+    return null;
   }
 
   /** Webhook /send and /notify handler (same formatting pipeline as replies). */
@@ -2702,9 +2719,113 @@ async function runDaemon(): Promise<void> {
     shutdown("SIGTERM").catch(() => {});
   });
 
+  // ── Scheduler (cron-style: daily HH:MM or every:N minutes) ───────────
+  /** Last time each schedule key fired (ms) — for every:N and dedup. */
+  const scheduleLastFired = new Map<string, number>();
+  /** Which day a daily schedule already fired (key → YYYY-MM-DD). */
+  const scheduleFiredDay = new Map<string, string>();
+
+  function parseScheduleKey(
+    key: string,
+  ): { kind: "daily"; hh: number; mm: number; ss: number } | { kind: "every"; minutes: number } | null {
+    const trimmed = key.trim();
+    const everyMatch = trimmed.match(/^every:(\d+)$/i);
+    if (everyMatch) {
+      const minutes = parseInt(everyMatch[1], 10);
+      if (minutes > 0) return { kind: "every", minutes };
+      return null;
+    }
+    const dailyMatch = trimmed.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if (dailyMatch) {
+      const hh = parseInt(dailyMatch[1], 10);
+      const mm = parseInt(dailyMatch[2], 10);
+      const ss = dailyMatch[3] ? parseInt(dailyMatch[3], 10) : 0;
+      if (hh < 24 && mm < 60 && ss < 60) return { kind: "daily", hh, mm, ss };
+    }
+    return null;
+  }
+
+  /** Fire one schedule: push-mode sends text directly; otherwise inject a pi prompt. */
+  async function fireSchedule(key: string, message: string): Promise<void> {
+    const target = resolveWebhookTarget("");
+    if (!target) {
+      logWarn(`[sched] ${key} 触发但没有可用的接收者（用户尚未发过消息）`);
+      return;
+    }
+    const pushMode = message.startsWith("push:");
+    const text = pushMode ? message.slice(5).trim() : message;
+
+    if (pushMode) {
+      const prefix = config.replyPrefix ?? "";
+      await sendWeixinReply(api, target.account, target.userId, target.contextToken, target.sessionId, `${prefix}${text}`);
+      log(`[sched] ${key} 推送: ${text.slice(0, 60)}`);
+      return;
+    }
+
+    // Prompt mode: inject into pi like a user message
+    const qm: QueuedMessage = {
+      account: target.account,
+      userId: target.userId,
+      contextToken: target.contextToken,
+      sessionId: target.sessionId,
+      sessionKey: target.sessionKey,
+      text: `【定时任务 ${key}】${text}`,
+    };
+    if (!processingWeixin && !rpcClient?.isStreaming && !sm.isWaitingUIResponse) {
+      await injectMessage(qm).catch((err) =>
+        logWarn(`[sched] 注入失败: ${err instanceof Error ? err.message : String(err)}`),
+      );
+    } else {
+      enqueueMessage(qm);
+      setImmediate(() => flushQueue());
+      log(`[sched] ${key} 已排队注入`);
+    }
+  }
+
+  /** Check all schedules; fires due ones. Called every 15s. */
+  async function checkSchedules(): Promise<void> {
+    const schedules = config.schedules ?? {};
+    const now = new Date();
+    const nowMs = Date.now();
+    const today = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`;
+
+    for (const [key, message] of Object.entries(schedules)) {
+      const spec = parseScheduleKey(key);
+      if (!spec) {
+        if (!scheduleLastFired.has(key)) {
+          logWarn(`[sched] 无效的调度键 "${key}"（支持 HH:MM 或 every:N）`);
+          scheduleLastFired.set(key, nowMs);
+        }
+        continue;
+      }
+
+      if (spec.kind === "daily") {
+        if (scheduleFiredDay.get(key) === today) continue;
+        const currentSeconds = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+        const targetSeconds = spec.hh * 3600 + spec.mm * 60 + spec.ss;
+        // Fire within the 15s check window right after the target time
+        if (currentSeconds >= targetSeconds && currentSeconds < targetSeconds + 20) {
+          scheduleFiredDay.set(key, today);
+          await fireSchedule(key, message);
+        }
+      } else {
+        const last = scheduleLastFired.get(key) ?? 0;
+        if (nowMs - last >= spec.minutes * 60_000) {
+          scheduleLastFired.set(key, nowMs);
+          await fireSchedule(key, message);
+        }
+      }
+    }
+  }
+
   // ── Start status heartbeat ──────────────────────────────────────────
   writeStatusHeartbeat();
   setInterval(writeStatusHeartbeat, 5_000).unref();
+
+  // ── Start scheduler (every 15s) ─────────────────────────────────────
+  setInterval(() => {
+    void checkSchedules();
+  }, 15_000).unref();
 
   // ── Process any messages recovered from a previous run ──────────────
   // flushQueue normally only fires on agent_end; at startup nothing

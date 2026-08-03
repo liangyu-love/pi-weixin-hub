@@ -47,6 +47,11 @@ export interface WeixinConfig {
   userModels?: Record<string, string>;
   /** 讨论优先：默认禁止自主执行工具/改文件，需用户明确同意。 */
   requireApproval?: boolean;
+  /**
+   * 定时任务：{ "HH:MM" | "every:N": 消息 }。
+   * 消息以 "push:" 开头则直接推送文本；否则作为 prompt 注入 pi 后回复。
+   */
+  schedules?: Record<string, string>;
   /** 本地 webhook 端口（0 = 禁用）；供 Pi 扩展/脚本主动推送消息。 */
   webhookPort?: number;
   /** webhook 访问令牌（空则 daemon 启动时自动生成）。 */
@@ -94,6 +99,7 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   costAlert: 0,
   userModels: {},
   requireApproval: true,
+  schedules: {},
   webhookPort: 0,
   webhookToken: "",
   groupChat: false,
@@ -237,6 +243,24 @@ export function setConfigValue(
       return null;
     }
 
+    case "schedules": {
+      try {
+        const parsed = JSON.parse(rawValue);
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return `schedules 必须是 JSON 对象，如 {"8:00":"早上好","every:30":"定时检查"}`;
+        }
+        for (const v of Object.values(parsed)) {
+          if (typeof v !== "string") {
+            return `schedules 的值必须是字符串`;
+          }
+        }
+        config.schedules = parsed as Record<string, string>;
+        return null;
+      } catch {
+        return `schedules 必须是 JSON 对象，如 {"8:00":"早上好","every:30":"定时检查"}`;
+      }
+    }
+
     case "autoCompactThreshold": {
       const n = parseInt(rawValue, 10);
       if (isNaN(n) || n < 0 || n > 100) return `autoCompactThreshold 必须是 0-100 的数字（0=禁用）`;
@@ -351,6 +375,12 @@ export function describeConfig(config: WeixinConfig): string {
       : "(无)",
   );
   label("requireApproval", config.requireApproval !== false ? "启用（讨论优先，执行需同意）" : "禁用（自主执行）");
+  label(
+    "schedules",
+    config.schedules && Object.keys(config.schedules).length > 0
+      ? Object.entries(config.schedules).map(([k, v]) => `${k}=${v.slice(0, 24)}`).join(" · ")
+      : "(无)",
+  );
   label("webhookPort", config.webhookPort && config.webhookPort > 0 ? `127.0.0.1:${config.webhookPort}` : "(禁用)");
   label("webhookToken", config.webhookToken ? `${config.webhookToken.slice(0, 6)}...` : "(自动生成)");
   label("groupChat", config.groupChat ? "启用" : "禁用（忽略群消息）");

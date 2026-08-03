@@ -329,6 +329,7 @@ pi-weixin-cli 支持接收微信视频消息：
 | `costAlert` | number | `0` | 月度费用预算（USD，超限时微信提醒，`0` = 禁用） |
 | `userModels` | object | `{}` | 每用户模型映射 `{ "userId": "provider/modelId" }` |
 | `requireApproval` | boolean | `true` | 讨论优先：默认禁止自主执行工具/改文件，执行需用户明确同意 |
+| `schedules` | object | `{}` | 定时任务 `{ "8:00": "早安", "every:30": "push:提醒" }` |
 | `groupChat` | boolean | `false` | 是否响应群聊消息 |
 | `botName` | string | `""` | 群聊触发昵称（消息需含 `@botName`；空 = 处理所有群消息） |
 | `maxReplyLength` | number | `2000` | 单条回复最大字符数，超过自动拆分（`0` = 不拆分） |
@@ -411,6 +412,28 @@ cp extension/pi-weixin-hub.ts ~/.pi/agent/extensions/
 - **人设**：`config set persona "你是我的微信私人助理"`，每条 prompt 自动注入
 - **长期记忆**：编辑 `~/.config/pi-weixin-cli/memory.md`（或直接告诉 Pi 更新它），内容会随每条 prompt 注入；`/memory` 命令可查看
 - **自动压缩**：上下文使用率 ≥ `autoCompactThreshold`（默认 80%）时，下一条消息前自动 `/compact`，避免长对话触发上下文溢出
+
+## 定时任务（Scheduler）
+
+daemon 内置调度器（每 15 秒检查一次），两种触发方式：
+
+```bash
+config set schedules '{"8:00":"早安，今天有什么安排？", "every:30":"push:该喝水了"}'
+```
+
+| 键格式 | 说明 |
+|--------|------|
+| `HH:MM`（或 `HH:MM:SS`）| 每天固定时间触发一次 |
+| `every:N` | 每 N 分钟触发一次 |
+
+| 值 | 行为 |
+|-----|------|
+| 普通文本 | 作为 prompt 注入 pi → pi 处理后回复（自动投递给最近/已知用户） |
+| `push:` 前缀 | 直接推送文本，不经过 pi |
+
+- 投递目标：最近发过消息的用户；daemon 重启后回退到已存储的 context token 用户
+- daemon 运行中才会触发（停机期间错过的定时任务不会补发）
+- 修改 `schedules` 后需重启 daemon 生效
 
 ## 执行规则（讨论优先）
 

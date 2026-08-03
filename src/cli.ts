@@ -61,6 +61,7 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   costAlert         月度费用预算（USD，0=禁用）
   userModels        每用户模型映射 JSON，如 {"uid":"provider/model"}
   requireApproval   讨论优先：禁止自主执行工具/改文件，需用户同意 (true/false)
+  schedules         定时任务 JSON，如 {"8:00":"早安","every:30":"push:提醒"}（push:前缀=直接推送）
   --fork            后台启动 daemon（分离进程 + PID 文件）
   groupChat          群聊模式 (true/false)
   botName            群聊 @ 触发昵称 (如 "mybot"，空=处理所有群消息)
