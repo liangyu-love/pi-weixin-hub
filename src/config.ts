@@ -69,6 +69,12 @@ export interface WeixinConfig {
   visionSubagent?: string;
   /** 强制将图片以 base64 直接附加到 prompt（覆盖自动检测）。默认 false。 */
   attachImages?: boolean;
+  /** 收到文件时是否自动用 MarkItDown 转成 Markdown 再发给 Pi。默认 true。 */
+  autoConvertDocuments?: boolean;
+  /** 自动转换后发给 Pi 的 Markdown 最大字符数。默认 8000。 */
+  documentMaxChars?: number;
+  /** 自动转换的文件大小上限（MB）。默认 20。 */
+  documentMaxMb?: number;
 }
 
 export const DEFAULT_CONFIG: WeixinConfig = {
@@ -97,6 +103,9 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   typingIndicator: true,
   visionSubagent: "vision",
   attachImages: false,
+  autoConvertDocuments: true,
+  documentMaxChars: 8000,
+  documentMaxMb: 20,
 };
 
 function getConfigPath(): string {
@@ -241,7 +250,8 @@ export function setConfigValue(
     case "groupChat":
     case "persistentSession":
     case "visionAgent":
-    case "attachImages": {
+    case "attachImages":
+    case "autoConvertDocuments": {
       const v = rawValue === "true" || rawValue === "1" || rawValue === "yes";
       (config as unknown as Record<string, unknown>)[key] = v;
       return null;
@@ -279,6 +289,20 @@ export function setConfigValue(
     case "visionSubagent":
       config.visionSubagent = rawValue || undefined;
       return null;
+
+    case "documentMaxChars": {
+      const n = parseInt(rawValue, 10);
+      if (isNaN(n) || n < 0) return `documentMaxChars 必须是 >= 0 的数字`;
+      config.documentMaxChars = n;
+      return null;
+    }
+
+    case "documentMaxMb": {
+      const n = parseInt(rawValue, 10);
+      if (isNaN(n) || n < 1) return `documentMaxMb 必须是 >= 1 的数字（MB）`;
+      config.documentMaxMb = n;
+      return null;
+    }
 
     default:
       return `未知配置项 "${key}"`;
@@ -330,5 +354,8 @@ export function describeConfig(config: WeixinConfig): string {
   label("typingIndicator", config.typingIndicator ? "启用" : "禁用");
   label("visionSubagent", config.visionSubagent ?? "vision");
   label("attachImages", config.attachImages ? "启用" : "禁用（走 vision 子代理）");
+  label("autoConvertDocuments", config.autoConvertDocuments ? "启用" : "禁用");
+  label("documentMaxChars", config.documentMaxChars ? `${config.documentMaxChars} 字符` : "(0=不限)");
+  label("documentMaxMb", `${config.documentMaxMb ?? 20} MB`);
   return lines.join("\n");
 }

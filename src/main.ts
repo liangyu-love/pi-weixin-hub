@@ -46,6 +46,7 @@ import type { WeixinAccount, WeixinMessage, ImageItem, FileItem, VoiceItem, Vide
 import { MessageItemType, MessageType, MessageState } from "./types.js";
 import type { AgentEndEvent, ExtensionUIRequestEvent, ImageContent } from "./types-rpc.js";
 import { downloadImageForWeixin, saveFileLocally, saveVoiceLocally, saveVideoLocally, setMediaLogLevel } from "./media-handler.js";
+import { convertDocumentToMarkdown, setDocConvertLogLevel } from "./document-converter.js";
 import { StateMachine, type UIMethod, type UIRequestContext } from "./state-machine.js";
 import { formatUIRequestForWeixin, isFireAndForget, parseUserResponse } from "./ui-bridge.js";
 import { runCLI } from "./cli.js";
@@ -201,6 +202,7 @@ async function runDaemon(): Promise<void> {
   const effectiveLogLevel = resolveLogLevel(config.logLevel);
   logger.setLevel(effectiveLogLevel);
   setMediaLogLevel(effectiveLogLevel);
+  setDocConvertLogLevel(effectiveLogLevel);
   setRpcLogLevel(effectiveLogLevel);
   if (config.logFile) {
     setLogFile(config.logFile, config.logMaxBytes ?? 5 * 1024 * 1024);
@@ -1340,11 +1342,14 @@ async function runDaemon(): Promise<void> {
   }
 
   // ── Fire-and-forget UI notification buffer (debounced merging) ───────
-  /** Accumulated notification lines waiting to be sent. */
+  /** Buffered notification lines waiting to be sent. */
   const uiNotifyBuffer: string[] = [];
   /** Routing context captured with the first buffered notification. */
   let uiNotifyCtx: PendingContext | null = null;
   let uiNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Last forwarded notification text + time (for progress-spam dedup). */
+  let lastNotifyText = "";
+  let lastNotifyAt = 0;
 
   /** Flush buffered notifications as a single WeChat message. */
   function flushUiNotifications(): void {
@@ -1366,6 +1371,17 @@ async function runDaemon(): Promise<void> {
 
   /** Buffer a notification; consecutive ones are merged after 1.5s. */
   function bufferUiNotification(ctx: PendingContext, text: string): void {
+    // Dedup: identical notification text within 30s is progress spam from
+    // a long agentic turn — forward it only once.
+    const now = Date.now();
+    if (text === lastNotifyText && now - lastNotifyAt < 30_000) {
+      logDebug(`[rpc] 忽略重复通知: ${text.slice(0, 60)}`);
+      return;
+    }
+    lastNotifyText = text;
+    lastNotifyAt = now;
+    logDebug(`[rpc] notify 转发: ${text.slice(0, 80)}`);
+
     uiNotifyCtx = uiNotifyCtx ?? ctx;
     uiNotifyBuffer.push(text);
     if (uiNotifyTimer) return;
@@ -1786,7 +1802,30 @@ async function runDaemon(): Promise<void> {
     // Append file path to message text if present
     if (filePath) {
       const fileName = qm.fileItem?.file_name ?? "unknown";
-      messageText += `\n\n[用户发送了一个文件：${fileName}]\n📄 ${filePath}\n（如需读取该文件内容，请调用 convert_document 工具转换）`;
+      let fileNote = `\n\n[用户发送了一个文件：${fileName}]\n📄 ${filePath}`;
+
+      // Auto-convert documents to Markdown in the pipeline (deterministic):
+      // the model receives the document content directly, no tool call needed.
+      if (config.autoConvertDocuments !== false) {
+        const converted = await convertDocumentToMarkdown(filePath, {
+          maxChars: config.documentMaxChars,
+          maxFileMb: config.documentMaxMb,
+        });
+        if (converted && converted.markdown.trim().length > 0) {
+          fileNote += `\n\n【文档内容（已自动转换为 Markdown）】\n${converted.markdown}`;
+          if (converted.truncated) {
+            fileNote += `\n\n…[文档全文共 ${converted.totalChars} 字符，仅显示前 ${config.documentMaxChars ?? 8000} 字符；如需完整内容，可让 Pi 用 convert_document 工具读取整个文件]`;
+          }
+        } else if (converted && converted.markdown.trim().length === 0) {
+          fileNote += `\n（该文件未能提取出文本内容，可能为扫描件/纯图片，可让 Pi 用视觉能力分析）`;
+        } else {
+          fileNote += `\n（如需读取该文件内容，请调用 convert_document 工具转换）`;
+        }
+      } else {
+        fileNote += `\n（如需读取该文件内容，请调用 convert_document 工具转换）`;
+      }
+
+      messageText += fileNote;
     }
 
     // ── Voice processing (save locally, give path + transcript to Pi) ─
@@ -1924,6 +1963,27 @@ async function runDaemon(): Promise<void> {
             logDebug(`[weixin] typing 状态发送失败: ${err instanceof Error ? err.message : String(err)}`);
           });
       });
+  }
+
+  /** Keepalive interval that refreshes the typing indicator during long turns. */
+  let typingKeepalive: ReturnType<typeof setInterval> | null = null;
+
+  /** Keep the '正在输入' indicator alive every 5s while a turn runs. */
+  function startTypingKeepalive(ctx: PendingContext): void {
+    if (!config.typingIndicator) return;
+    stopTypingKeepalive();
+    typingKeepalive = setInterval(() => {
+      sendTypingStatus(ctx.account, ctx.userId, ctx.contextToken, 1);
+    }, 5_000);
+    typingKeepalive.unref?.();
+  }
+
+  /** Stop the typing keepalive (called at turn finalize). */
+  function stopTypingKeepalive(): void {
+    if (typingKeepalive) {
+      clearInterval(typingKeepalive);
+      typingKeepalive = null;
+    }
   }
 
   // ── Media outbox (Pi writes manifests; daemon sends them as attachments) ──
@@ -2119,7 +2179,8 @@ async function runDaemon(): Promise<void> {
       const ctx = pendingContext;
       pendingContext = null;
 
-      // Release the typing indicator first
+      // Release the typing indicator first (and stop the keepalive)
+      stopTypingKeepalive();
       sendTypingStatus(ctx.account, ctx.userId, ctx.contextToken, 2);
 
       if (aborted) {
@@ -2189,9 +2250,10 @@ async function runDaemon(): Promise<void> {
       lastAgentError = null;
       pendingAbort = false; // a new turn means the previous abort is moot
       sm.setAgentRunning();
-      // Show the typing indicator while Pi works
+      // Show the typing indicator while Pi works, refreshed by a keepalive
       if (pendingContext) {
         sendTypingStatus(pendingContext.account, pendingContext.userId, pendingContext.contextToken, 1);
+        startTypingKeepalive(pendingContext);
       }
     });
 
@@ -2386,6 +2448,7 @@ async function runDaemon(): Promise<void> {
     pendingContext = null;
     processingWeixin = false;
     turnData = null;
+    stopTypingKeepalive();
     if (turnWatchdog) {
       clearTimeout(turnWatchdog);
       turnWatchdog = null;

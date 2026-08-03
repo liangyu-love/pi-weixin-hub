@@ -231,8 +231,9 @@ pi-weixin-hub 支持接收微信图片并**自适应处理**：
 pi-weixin-cli 支持接收微信文件并转发给 Pi：
 
 - 文件自动下载并保存到 `~/.config/pi-weixin-cli/files/`
-- 在 prompt 中告知 Pi 文件路径，Pi 可自行用 `read` 或 `bash` 工具处理
-- 支持任意文件类型（文本、PDF、压缩包、可执行文件等），无大小限制
+- **文档自动转 Markdown**：PDF/Word/Excel/PPT/HTML/文本/EPUB 等文件会用 Microsoft MarkItDown 自动转成 Markdown 内容直接发给 Pi（确定性转换，不依赖模型自行读文件；可用 `config set autoConvertDocuments false` 关闭，`documentMaxChars`/`documentMaxMb` 控制上限）
+- 转换失败或类型不支持时，降级为告知 Pi 文件路径（Pi 仍可用 `convert_document` 工具转换）
+- 支持任意文件类型（文本、PDF、压缩包、可执行文件等），无大小限制（仅自动转换有 20MB 默认上限）
 
 示例：用户发送 `report.pdf`，Pi 收到的消息为：
 
@@ -241,6 +242,10 @@ pi-weixin-cli 支持接收微信文件并转发给 Pi：
 
 [用户发送了一个文件：report.pdf]
 📄 /home/qq110/.config/pi-weixin-cli/files/2026-05-27_20-12-34_report.pdf
+
+【文档内容（已自动转换为 Markdown）】
+# 报告标题
+...
 ```
 
 ### 语音消息支持

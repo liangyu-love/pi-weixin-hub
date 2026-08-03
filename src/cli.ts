@@ -71,6 +71,9 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   typingIndicator    Pi 处理时显示“正在输入” (true/false)
   visionSubagent     vision 子代理名称 (默认 vision)
   attachImages       强制 base64 直接附加图片（覆盖自动检测） (true/false)
+  autoConvertDocuments  收到文件自动转 Markdown (true/false，默认 true)
+  documentMaxChars   自动转换后发给 Pi 的最大字符数 (默认 8000)
+  documentMaxMb      自动转换的文件大小上限 MB (默认 20)
 `;
 
 function printHelp(): void {
