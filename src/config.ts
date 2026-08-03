@@ -41,6 +41,10 @@ export interface WeixinConfig {
   retentionDays?: number;
   /** 崩溃恢复时队列消息的有效时长（分钟）。 */
   queueTtlMin?: number;
+  /** 月度费用告警阈值（USD，0 = 禁用）。 */
+  costAlert?: number;
+  /** 每用户模型映射：{ userId: "provider/modelId" }。 */
+  userModels?: Record<string, string>;
   /** 本地 webhook 端口（0 = 禁用）；供 Pi 扩展/脚本主动推送消息。 */
   webhookPort?: number;
   /** webhook 访问令牌（空则 daemon 启动时自动生成）。 */
@@ -79,6 +83,8 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   logMaxBytes: 5 * 1024 * 1024,
   retentionDays: 30,
   queueTtlMin: 30,
+  costAlert: 0,
+  userModels: {},
   webhookPort: 0,
   webhookToken: "",
   groupChat: false,
@@ -194,6 +200,26 @@ export function setConfigValue(
       return null;
     }
 
+    case "costAlert": {
+      const n = parseFloat(rawValue);
+      if (isNaN(n) || n < 0) return `costAlert 必须是 >= 0 的数字（USD，0=禁用）`;
+      config.costAlert = n;
+      return null;
+    }
+
+    case "userModels": {
+      try {
+        const parsed = JSON.parse(rawValue);
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return `userModels 必须是 JSON 对象，如 {"user1":"Axonhub/gpt-4o"}`;
+        }
+        config.userModels = parsed as Record<string, string>;
+        return null;
+      } catch {
+        return `userModels 必须是 JSON 对象，如 {"user1":"Axonhub/gpt-4o"}`;
+      }
+    }
+
     case "autoCompactThreshold": {
       const n = parseInt(rawValue, 10);
       if (isNaN(n) || n < 0 || n > 100) return `autoCompactThreshold 必须是 0-100 的数字（0=禁用）`;
@@ -285,6 +311,13 @@ export function describeConfig(config: WeixinConfig): string {
   label("logMaxBytes", config.logMaxBytes ? `${(config.logMaxBytes / 1024 / 1024).toFixed(1)}MB` : "(无限)");
   label("retentionDays", config.retentionDays && config.retentionDays > 0 ? `${config.retentionDays} 天` : "(不清理)");
   label("queueTtlMin", config.queueTtlMin && config.queueTtlMin > 0 ? `${config.queueTtlMin} 分钟` : "(不过期)");
+  label("costAlert", config.costAlert && config.costAlert > 0 ? `$${config.costAlert}/月` : "(禁用)");
+  label(
+    "userModels",
+    config.userModels && Object.keys(config.userModels).length > 0
+      ? Object.entries(config.userModels).map(([u, m]) => `${u}=${m}`).join(", ")
+      : "(无)",
+  );
   label("webhookPort", config.webhookPort && config.webhookPort > 0 ? `127.0.0.1:${config.webhookPort}` : "(禁用)");
   label("webhookToken", config.webhookToken ? `${config.webhookToken.slice(0, 6)}...` : "(自动生成)");
   label("groupChat", config.groupChat ? "启用" : "禁用（忽略群消息）");

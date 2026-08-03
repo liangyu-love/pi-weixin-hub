@@ -29,12 +29,13 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { WeixinApi } from "./api.js";
 import { Poller, type MessageCallback, type LogCallback } from "./poller.js";
 import { RpcClient, setRpcLogLevel } from "./rpc-client.js";
-import { loadAccounts, saveContextToken, loadContextTokens, loadUserSession, saveUserSession, pruneSessionMap } from "./storage.js";
+import { loadAccounts, saveContextToken, loadContextTokens, loadUserSession, saveUserSession, pruneSessionMap, loadUsage, addUsage, totalAccountCost } from "./storage.js";
 import { loadConfig, saveConfig } from "./config.js";
 import { startWebhookServer, type WebhookServer } from "./webhook.js";
 import { Logger, resolveLogLevel, setLogFile } from "./logger.js";
@@ -193,6 +194,10 @@ async function runDaemon(): Promise<void> {
 
   // ── Load config ──────────────────────────────────────────────────────
   const config = loadConfig();
+  // When forked into the background, default to a log file if none is set
+  if (!config.logFile && process.env.PI_FORKED === "1") {
+    config.logFile = path.join(os.homedir(), ".config", "pi-weixin-cli", "daemon.log");
+  }
   const effectiveLogLevel = resolveLogLevel(config.logLevel);
   logger.setLevel(effectiveLogLevel);
   setMediaLogLevel(effectiveLogLevel);
@@ -270,32 +275,68 @@ async function runDaemon(): Promise<void> {
     const model = config.defaultModel;
     if (!model) return;
     try {
-      if (model.includes("/")) {
-        const [provider, modelId] = model.split("/", 2);
-        await client.setModel(provider, modelId);
-        invalidateVisionCache();
-        log(`[rpc] 默认模型已应用: ${model}`);
-      } else {
-        const result = (await client.getAvailableModels()) as {
-          models?: Array<Record<string, unknown>>;
-        } | null;
-        const models = result?.models ?? [];
-        const found = models.find(
-          (m) => (m.id ?? m.modelId ?? m.name) === model,
-        ) as Record<string, unknown> | undefined;
-        if (found) {
-          await client.setModel(
-            (found.provider as string) ?? "",
-            (found.id ?? found.modelId) as string,
-          );
-          invalidateVisionCache();
-          log(`[rpc] 默认模型已应用: ${(found.name ?? found.id) as string}`);
-        } else {
-          logWarn(`[rpc] 默认模型 ${model} 不在可用模型列表中，跳过`);
-        }
-      }
+      await setModelByPattern(model);
+      invalidateVisionCache();
+      log(`[rpc] 默认模型已应用: ${model}`);
     } catch (err) {
       logWarn(`[rpc] 应用默认模型失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Set a model from a pattern: "provider/modelId" or a bare id/name
+   * resolved against the available-model list. Throws on failure.
+   */
+  async function setModelByPattern(pattern: string): Promise<void> {
+    if (!rpcClient) throw new Error("RpcClient 未连接");
+    if (pattern.includes("/")) {
+      const [provider, modelId] = pattern.split("/", 2);
+      await rpcClient.setModel(provider, modelId);
+      return;
+    }
+    const result = (await rpcClient.getAvailableModels()) as {
+      models?: Array<Record<string, unknown>>;
+    } | null;
+    const found = (result?.models ?? []).find(
+      (m) => (m.id ?? m.modelId ?? m.name) === pattern,
+    ) as Record<string, unknown> | undefined;
+    if (!found) throw new Error(`模型未找到: ${pattern}`);
+    await rpcClient.setModel((found.provider as string) ?? "", (found.id ?? found.modelId) as string);
+  }
+
+  // ── Per-user model mapping (E2) ───────────────────────────────────────
+
+  /** Last applied per-user model: { userId, model } for change detection. */
+  let appliedUserModel: { userId: string; model: string | null } | null = null;
+
+  /**
+   * Apply config.userModels for a user; when the user has no mapping,
+   * restore config.defaultModel if we previously applied a mapped model.
+   */
+  async function applyUserModel(userId: string): Promise<void> {
+    if (!rpcClient) return;
+    const mapped = config.userModels?.[userId]?.trim();
+    if (mapped) {
+      if (appliedUserModel?.userId === userId && appliedUserModel.model === mapped) return;
+      try {
+        await setModelByPattern(mapped);
+        invalidateVisionCache();
+        appliedUserModel = { userId, model: mapped };
+        log(`[rpc] 用户模型已应用 (${userId}): ${mapped}`);
+      } catch (err) {
+        logWarn(`[rpc] 用户模型应用失败 (${userId}): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else if (appliedUserModel && appliedUserModel.userId !== userId) {
+      // Switching to an unmapped user — restore the default model if configured
+      if (config.defaultModel) {
+        try {
+          await setModelByPattern(config.defaultModel);
+          invalidateVisionCache();
+        } catch (err) {
+          logWarn(`[rpc] 恢复默认模型失败: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      appliedUserModel = { userId, model: null };
     }
   }
 
@@ -964,6 +1005,25 @@ async function runDaemon(): Promise<void> {
           break;
         }
 
+        case "usage": {
+          const map = loadUsage(account.id);
+          const totalTokens = Object.values(map).reduce((s, u) => s + u.tokens, 0);
+          const totalCost = Object.values(map).reduce((s, u) => s + u.cost, 0);
+          const lines = ["📊 用量统计："];
+          for (const [key, u] of Object.entries(map)) {
+            const label = key === "" ? "默认会话" : key.slice(0, 16);
+            lines.push(`  ${label}: ${fmtTokens(u.tokens)} tokens · $${u.cost.toFixed(4)} · ${u.turns} 轮`);
+          }
+          lines.push(`\n合计: ${fmtTokens(totalTokens)} tokens · $${totalCost.toFixed(2)}`);
+          const budget = config.costAlert ?? 0;
+          if (budget > 0) {
+            lines.push(`预算: $${budget}/月 ${totalCost >= budget ? "（已超限）" : ""}`);
+          }
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, lines.join("\n"));
+          log(`[slash] /usage (user=${userId})`);
+          break;
+        }
+
         case "memory": {
           const memPath = memoryFilePath();
           const content = readMemoryFile() ?? "";
@@ -1104,6 +1164,7 @@ async function runDaemon(): Promise<void> {
             "/abort — 中止当前任务",
             "/session — 查看 session 状态",
             "/status — 查看会话状态 + 队列信息",
+            "/usage — 查看用量统计（token/费用）",
             "/messages — 查看对话消息",
             "/export [path] — 导出 session 为 HTML",
             "/resume — 恢复历史 session",
@@ -1593,6 +1654,21 @@ async function runDaemon(): Promise<void> {
     // ── Auto-compact if the previous turn left the context near full ──
     await compactIfNeeded();
 
+    // ── Per-user model mapping (E2) ─────────────────────────────────
+    await applyUserModel(qm.userId);
+
+    // ── Snapshot usage baseline for cost attribution (E1) ──────────
+    usageBaseline = null;
+    try {
+      const stats = (await rpcClient.getSessionStats()) as {
+        tokens?: { total?: number } | null;
+        cost?: number | null;
+      } | null;
+      usageBaseline = { tokens: stats?.tokens?.total ?? 0, cost: stats?.cost ?? 0 };
+    } catch {
+      /* ignore */
+    }
+
     let messageText = qm.text;
     let imagePath: string | null = null;
     let imageContent: ImageContent | null = null;
@@ -1893,26 +1969,67 @@ async function runDaemon(): Promise<void> {
     return buildContextPrefix(config.persona);
   }
 
-  // ── Auto-compact before long turns (C3) ──────────────────────────────
+  // ── Auto-compact + usage tracking (C3/E1) ────────────────────────────
 
   /** Whether the next idle turn should compact first (set by stats check). */
   let needsCompact = false;
 
-  /** Check context usage; flag the next turn for auto-compact if near full. */
-  async function checkContextUsage(): Promise<void> {
-    const threshold = config.autoCompactThreshold ?? 0;
-    if (threshold <= 0 || !rpcClient) return;
+  /** Baseline (tokens/cost) captured at inject time for this turn's deltas. */
+  let usageBaseline: { tokens: number; cost: number } | null = null;
+  /** Whether the cost alert has already fired this run. */
+  let costAlerted = false;
+
+  /**
+   * After a turn: record usage deltas, set the auto-compact flag, and
+   * fire the cost alert when the monthly budget is exceeded.
+   */
+  async function afterTurnStats(accountId: string, sessionKey: string): Promise<void> {
+    if (!rpcClient) return;
     try {
       const stats = (await rpcClient.getSessionStats()) as {
+        tokens?: { total?: number } | null;
+        cost?: number | null;
         contextUsage?: { percent?: number | null } | null;
       } | null;
+      const totalTokens = stats?.tokens?.total ?? 0;
+      const totalCost = stats?.cost ?? 0;
+
+      // ── Usage deltas (E1) ─────────────────────────────────────────
+      if (usageBaseline) {
+        const tDelta = totalTokens - usageBaseline.tokens;
+        const cDelta = totalCost - usageBaseline.cost;
+        if (tDelta > 0 || cDelta > 0) {
+          addUsage(accountId, sessionKey, tDelta, cDelta);
+        }
+      }
+      usageBaseline = null;
+
+      // ── Auto-compact flag (C3) ────────────────────────────────────
+      const threshold = config.autoCompactThreshold ?? 0;
       const percent = stats?.contextUsage?.percent;
-      if (typeof percent === "number" && percent >= threshold) {
+      if (threshold > 0 && typeof percent === "number" && percent >= threshold) {
         needsCompact = true;
         log(`[rpc] 上下文使用率 ${percent.toFixed(1)}% ≥ ${threshold}%，下轮自动压缩`);
       }
+
+      // ── Cost alert (E1) ───────────────────────────────────────────
+      const budget = config.costAlert ?? 0;
+      if (budget > 0 && !costAlerted) {
+        const spent = totalAccountCost(accountId);
+        if (spent >= budget) {
+          costAlerted = true;
+          logWarn(`[usage] 本月费用 $${spent.toFixed(2)} 已超过预算 $${budget}！`);
+          const target = lastSenderGlobal;
+          if (target) {
+            sendWeixinReply(
+              api, target.account, target.userId, target.contextToken, target.sessionId,
+              `💸 费用提醒：本月已花费 $${spent.toFixed(2)}，达到预算上限 $${budget}。`,
+            ).catch(() => {});
+          }
+        }
+      }
     } catch {
-      /* best effort */
+      usageBaseline = null;
     }
   }
 
@@ -1998,8 +2115,8 @@ async function runDaemon(): Promise<void> {
       // ── Persist the session file path (per-user map, for resume) ──
       await persistCurrentSession(ctx.account.id, ctx.sessionKey);
 
-      // ── Check context usage for the next-turn auto-compact decision ──
-      void checkContextUsage();
+      // ── Usage tracking + auto-compact flag + cost alert (E1/C3) ──
+      void afterTurnStats(ctx.account.id, ctx.sessionKey);
 
       processingWeixin = false;
     } else if (reply) {
@@ -2468,6 +2585,27 @@ async function runDaemon(): Promise<void> {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+
+  // ── Background fork (E3) ────────────────────────────────────────────
+  if (args[0] === "--fork") {
+    const stateDir = path.join(os.homedir(), ".config", "pi-weixin-cli");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const ownEntry = fileURLToPath(import.meta.url); // dist/main.js
+    const child = spawn(process.execPath, [ownEntry, "daemon"], {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, PI_FORKED: "1" },
+    });
+    child.unref();
+    try {
+      fs.writeFileSync(path.join(stateDir, "daemon.pid"), String(child.pid ?? ""), "utf-8");
+    } catch {
+      /* ignore */
+    }
+    console.log(`pi-weixin-hub daemon 已后台启动 (PID ${child.pid ?? "?"})`);
+    console.log("日志: ~/.config/pi-weixin-cli/daemon.log（未配置 logFile 时自动启用）");
+    process.exit(0);
+  }
 
   if (args.length === 0 || args[0] === "daemon") {
     await runDaemon();

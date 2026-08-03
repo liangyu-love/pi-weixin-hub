@@ -56,6 +56,9 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   logMaxBytes       日志轮转大小（字节）
   retentionDays     媒体/会话保留天数 (0=不清理)
   queueTtlMin       队列消息有效期（分钟）
+  costAlert         月度费用预算（USD，0=禁用）
+  userModels        每用户模型映射 JSON，如 {"uid":"provider/model"}
+  --fork            后台启动 daemon（分离进程 + PID 文件）
   groupChat          群聊模式 (true/false)
   botName            群聊 @ 触发昵称 (如 "mybot"，空=处理所有群消息)
   maxReplyLength     单条回复最大字符数 (0=不拆分)

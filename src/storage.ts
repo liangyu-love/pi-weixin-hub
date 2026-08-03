@@ -224,6 +224,61 @@ export function pruneSessionMap(accountId: string, cutoffMs: number): number {
   return removed;
 }
 
+// ── Usage tracking (per session key) ───────────────────────────────────
+
+export interface UserUsage {
+  tokens: number;
+  cost: number;
+  turns: number;
+}
+
+function usagePath(accountId: string): string {
+  return path.join(getStateDir(), `${safeId(accountId)}-usage.json`);
+}
+
+/** Load the per-session usage map for an account. */
+export function loadUsage(accountId: string): Record<string, UserUsage> {
+  try {
+    const filePath = usagePath(accountId);
+    if (!fs.existsSync(filePath)) return {};
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    if (parsed && typeof parsed === "object") {
+      return parsed as Record<string, UserUsage>;
+    }
+  } catch {
+    /* ignore */
+  }
+  return {};
+}
+
+/** Add a usage delta (tokens/cost) for a session key and persist. */
+export function addUsage(
+  accountId: string,
+  sessionKey: string,
+  tokensDelta: number,
+  costDelta: number,
+): void {
+  const map = loadUsage(accountId);
+  const entry = map[sessionKey] ?? { tokens: 0, cost: 0, turns: 0 };
+  entry.tokens += Math.max(0, tokensDelta);
+  entry.cost += Math.max(0, costDelta);
+  entry.turns += 1;
+  map[sessionKey] = entry;
+  try {
+    const filePath = usagePath(accountId);
+    ensureDir(path.dirname(filePath));
+    fs.writeFileSync(filePath, JSON.stringify(map, null, 2), "utf-8");
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Total accumulated cost across all session keys of an account. */
+export function totalAccountCost(accountId: string): number {
+  const map = loadUsage(accountId);
+  return Object.values(map).reduce((sum, u) => sum + (u.cost ?? 0), 0);
+}
+
 // ── Context Token Storage (per-account, per-user) ──────────────────────
 
 const CTX_TOKEN_DIR = "context-tokens";

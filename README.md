@@ -321,6 +321,8 @@ pi-weixin-cli 支持接收微信视频消息：
 | `logMaxBytes` | number | `5242880` | 日志轮转大小（字节，保留 2 个备份） |
 | `retentionDays` | number | `30` | 媒体/会话保留天数（`0` = 不清理） |
 | `queueTtlMin` | number | `30` | 崩溃恢复时队列消息有效期（分钟，`0` = 不过期） |
+| `costAlert` | number | `0` | 月度费用预算（USD，超限时微信提醒，`0` = 禁用） |
+| `userModels` | object | `{}` | 每用户模型映射 `{ "userId": "provider/modelId" }` |
 | `groupChat` | boolean | `false` | 是否响应群聊消息 |
 | `botName` | string | `""` | 群聊触发昵称（消息需含 `@botName`；空 = 处理所有群消息） |
 | `maxReplyLength` | number | `2000` | 单条回复最大字符数，超过自动拆分（`0` = 不拆分） |
@@ -403,6 +405,13 @@ cp extension/pi-weixin-hub.ts ~/.pi/agent/extensions/
 - **人设**：`config set persona "你是我的微信私人助理"`，每条 prompt 自动注入
 - **长期记忆**：编辑 `~/.config/pi-weixin-cli/memory.md`（或直接告诉 Pi 更新它），内容会随每条 prompt 注入；`/memory` 命令可查看
 - **自动压缩**：上下文使用率 ≥ `autoCompactThreshold`（默认 80%）时，下一条消息前自动 `/compact`，避免长对话触发上下文溢出
+
+## 成本与模型控制（Phase E）
+
+- **用量统计**：每个会话（默认/群内各用户）的 token 与费用自动记账（`<账号>-usage.json`）；微信内发送 `/usage` 查看
+- **费用告警**：`config set costAlert 10` 设置月度预算（USD），超限时自动微信提醒一次
+- **每用户模型**：`config set userModels '{"wx-user-1":"Axonhub/deepseek-v4-pro"}'` — 不同用户使用不同模型（无映射的用户恢复 `defaultModel`）
+- **后台运行**：`pi-weixin-hub --fork` 以分离进程后台启动（自动 PID 文件 + 默认日志文件），`status` 可查看运行状态
 
 ## 可靠性（Phase D）
 
