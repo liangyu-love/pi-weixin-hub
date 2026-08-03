@@ -34,6 +34,7 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   logout [id]        登出账号。不指定 id 时列出所有账号；使用 --all 删除全部
   status             显示所有已登录账号及其状态
   doctor             运行环境自检（pi 路径/配置/账号/网络/daemon）
+  stop               停止后台 daemon（读取 daemon.pid）
   toggle             切换消息接收功能（启用/禁用）
   config show        显示当前配置
   config set <k> <v> 修改配置项（如 allowlist、groupChat、maxReplyLength）
@@ -160,6 +161,39 @@ function handleLogout(args: string[]): number {
   process.stdout.write("\n用法: pi-weixin-hub logout <账号ID>\n");
   process.stdout.write("  或: pi-weixin-hub logout --all    (删除全部)\n");
   return 0;
+}
+
+/** stop — 停止后台 daemon（按 daemon.pid）。 */
+function handleStopDaemon(): number {
+  try {
+    const pidFile = path.join(os.homedir(), ".config", "pi-weixin-cli", "daemon.pid");
+    if (!fs.existsSync(pidFile)) {
+      process.stdout.write("未找到 daemon.pid — daemon 可能未以 --fork 方式运行。\n");
+      return 1;
+    }
+    const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+    if (!pid) {
+      process.stdout.write("daemon.pid 内容无效。\n");
+      return 1;
+    }
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      process.stdout.write(`PID ${pid} 已不存在（daemon 可能已停止）。\n`);
+      fs.unlinkSync(pidFile);
+      return 0;
+    }
+    process.stdout.write(`已发送停止信号到 daemon (PID ${pid})。\n`);
+    try {
+      fs.unlinkSync(pidFile);
+    } catch {
+      /* ignore */
+    }
+    return 0;
+  } catch (err) {
+    process.stderr.write(`停止失败: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
 }
 
 /** status — 显示 daemon 状态 + 所有已保存的账号。 */
@@ -333,6 +367,9 @@ export async function runCLI(args: string[]): Promise<number> {
 
     case "status":
       return handleStatus();
+
+    case "stop":
+      return handleStopDaemon();
 
     case "doctor":
       return await runDoctor();

@@ -2594,6 +2594,7 @@ async function main(): Promise<void> {
     const child = spawn(process.execPath, [ownEntry, "daemon"], {
       detached: true,
       stdio: "ignore",
+      windowsHide: true, // hide the console window on Windows
       env: { ...process.env, PI_FORKED: "1" },
     });
     child.unref();
