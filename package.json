@@ -1,6 +1,6 @@
 {
   "name": "pi-weixin-hub",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": false,
   "type": "module",
   "description": "Weixin (WeChat) bridge for Pi Agent — enhanced fork of pi-weixin-cli with vision image analysis, persistent sessions, allowlist, group chat mode, and WeChat-optimized replies",

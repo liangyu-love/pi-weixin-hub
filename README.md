@@ -309,6 +309,8 @@ pi-weixin-cli 支持接收微信视频消息：
 | `enabled` | boolean | `true` | daemon 启动时是否启用消息接收 |
 | `defaultModel` | string | `""` | 启动时切换到的默认模型（`provider/modelId` 或模型名） |
 | `allowlist` | string[] | `[]` | 允许使用 bot 的用户 ID 列表；空 = 允许所有用户 |
+| `blocklist` | string[] | `[]` | 拉黑用户 ID 列表（消息被静默忽略） |
+| `rateLimitMax` | number | `0` | 每用户每分钟最大消息数（`0` = 不限） |
 | `groupChat` | boolean | `false` | 是否响应群聊消息 |
 | `botName` | string | `""` | 群聊触发昵称（消息需含 `@botName`；空 = 处理所有群消息） |
 | `maxReplyLength` | number | `2000` | 单条回复最大字符数，超过自动拆分（`0` = 不拆分） |
@@ -321,6 +323,31 @@ pi-weixin-cli 支持接收微信视频消息：
 
 所有配置项都可通过 `config set` 命令动态修改（如 `pi-weixin-hub config set logLevel debug`），
 下次启动时生效。日志级别也可用 `LOG_LEVEL` 环境变量覆盖（优先级更高）。
+
+## 防刷与消息合并（Step 10–11）
+
+- **限流**：`rateLimitMax` 设置每用户每分钟消息上限（默认 0 = 不限）。超限的消息被丢弃，
+  并每分钟最多提示一次「消息发送过于频繁」。
+- **黑名单**：`blocklist` 中的用户消息被静默忽略（白名单优先检查，随后黑名单）。
+- **通知合并**：Pi 的连续 `notify` / `setStatus` 等 fire-and-forget 通知会在 1.5 秒内合并为
+  一条微信消息发送，避免刷屏；对话请求（select/confirm/input）会先刷新缓冲的通知再提问。
+
+## 状态面板（Step 12）
+
+daemon 每 5 秒原子写入 `~/.config/pi-weixin-cli/daemon-status.json`（PID、运行时长、版本、
+账号、当前会话、队列长度、Pi 进程状态）。运行 `pi-weixin-hub status` 可查看终端仪表盘：
+
+```
+🟢 daemon 运行中
+  PID:          15976
+  版本:         0.4.0
+  运行时长:     6s
+  账号:         test-bot
+  当前会话:     (无)
+  待处理队列:   0 条
+  Pi 进程:      运行中
+  最近活动:     2026/8/3 14:51:40
+```
 
 ## 数据目录
 

@@ -25,6 +25,10 @@ export interface WeixinConfig {
   defaultModel?: string;
   /** 允许的用户 ID 列表；空数组 = 允许所有用户。 */
   allowlist?: string[];
+  /** 禁止的用户 ID 列表（拉黑）。 */
+  blocklist?: string[];
+  /** 每用户每分钟最大消息数（0 = 不限）。 */
+  rateLimitMax?: number;
   /** 是否处理群聊消息。 */
   groupChat?: boolean;
   /** 机器人昵称（群聊 @ 触发用）；空 = 处理所有群消息。 */
@@ -49,6 +53,8 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   enabled: true,
   defaultModel: undefined,
   allowlist: [],
+  blocklist: [],
+  rateLimitMax: 0,
   groupChat: false,
   botName: "",
   maxReplyLength: 2000,
@@ -116,6 +122,22 @@ export function setConfigValue(
       return null;
     }
 
+    case "blocklist": {
+      const ids = rawValue
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      config.blocklist = ids;
+      return null;
+    }
+
+    case "rateLimitMax": {
+      const n = parseInt(rawValue, 10);
+      if (isNaN(n) || n < 0) return `rateLimitMax 必须是 >= 0 的数字（0=不限）`;
+      config.rateLimitMax = n;
+      return null;
+    }
+
     case "groupChat":
     case "persistentSession":
     case "visionAgent":
@@ -171,6 +193,13 @@ export function describeConfig(config: WeixinConfig): string {
       ? config.allowlist.join(", ")
       : "(允许所有用户)",
   );
+  label(
+    "blocklist",
+    config.blocklist && config.blocklist.length > 0
+      ? config.blocklist.join(", ")
+      : "(无)",
+  );
+  label("rateLimitMax", config.rateLimitMax && config.rateLimitMax > 0 ? `${config.rateLimitMax} 条/分钟` : "(不限)");
   label("groupChat", config.groupChat ? "启用" : "禁用（忽略群消息）");
   label("botName", config.botName ? `@${config.botName} 触发` : "(处理所有群消息)");
   label("maxReplyLength", config.maxReplyLength === 0 ? "(不拆分)" : `${config.maxReplyLength} 字符`);

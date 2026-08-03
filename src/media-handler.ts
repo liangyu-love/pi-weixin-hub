@@ -30,7 +30,7 @@ const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 30_000;
 
 /** Reasonable User-Agent for image downloads. */
-const USER_AGENT = "pi-weixin-hub/0.4.0 (image downloader)";
+const USER_AGENT = "pi-weixin-hub/0.5.0 (image downloader)";
 
 // ── Public API ─────────────────────────────────────────────────────────
 

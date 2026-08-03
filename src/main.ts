@@ -29,6 +29,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 
 import { WeixinApi } from "./api.js";
 import { Poller, type MessageCallback, type LogCallback } from "./poller.js";
@@ -340,6 +341,53 @@ async function runDaemon(): Promise<void> {
   // ── Mutable state (may be reset during reconnect) ────────────────────
   let rpcClient: RpcClient | null = null;
   let shuttingDown = false;
+
+  // ── Daemon status heartbeat (for the CLI dashboard) ──────────────────
+  const daemonStartTime = Date.now();
+  let lastActivityAt = daemonStartTime;
+  let pkgVersion = "unknown";
+  try {
+    const moduleDir = path.dirname(fileURLToPath(import.meta.url)); // dist/
+    pkgVersion =
+      JSON.parse(fs.readFileSync(path.join(moduleDir, "..", "package.json"), "utf-8")).version ??
+      "unknown";
+  } catch {
+    /* keep unknown */
+  }
+
+  const STATUS_PATH = path.join(os.homedir(), ".config", "pi-weixin-cli", "daemon-status.json");
+
+  /** Atomically write the daemon heartbeat file (tmp + rename). */
+  function writeStatusHeartbeat(): void {
+    // Prune stale rate-limit state (per-user buckets older than the window)
+    const cutoff = Date.now() - 60_000;
+    for (const [uid, b] of rateBuckets) {
+      if (b.windowStart < cutoff) rateBuckets.delete(uid);
+    }
+    for (const [uid, t] of rateLimitedNotifiedAt) {
+      if (t < cutoff) rateLimitedNotifiedAt.delete(uid);
+    }
+
+    const status = {
+      pid: process.pid,
+      startTime: daemonStartTime,
+      uptimeSec: Math.round((Date.now() - daemonStartTime) / 1000),
+      version: pkgVersion,
+      accounts: accounts.map((a) => a.id),
+      sessionOwner: sessionOwnerKey ?? null,
+      queueLength: messageQueue.length,
+      processing: processingWeixin,
+      piRunning: rpcClient?.isRunning ?? false,
+      lastActivityAt,
+    };
+    try {
+      const tmp = `${STATUS_PATH}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(status, null, 2), "utf-8");
+      fs.renameSync(tmp, STATUS_PATH);
+    } catch {
+      /* best effort */
+    }
+  }
 
   // ── State Machine ────────────────────────────────────────────────────
   const sm = new StateMachine();
@@ -1006,6 +1054,72 @@ async function runDaemon(): Promise<void> {
   /** Text of the most recent RPC/agent error, used to classify failed turns. */
   let lastAgentError: string | null = null;
 
+  // ── Rate limiting (anti-spam) ────────────────────────────────────────
+  /** Per-user token buckets: userId → {count, windowStart}. */
+  const rateBuckets = new Map<string, { count: number; windowStart: number }>();
+  /** Last time a rate-limit notice was sent to each user. */
+  const rateLimitedNotifiedAt = new Map<string, number>();
+
+  /** Whether this user has exceeded their per-minute message budget. */
+  function isRateLimited(userId: string): boolean {
+    const max = config.rateLimitMax ?? 0;
+    if (max <= 0) return false;
+    const now = Date.now();
+    const windowMs = 60_000;
+    const bucket = rateBuckets.get(userId);
+    if (!bucket || now - bucket.windowStart >= windowMs) {
+      rateBuckets.set(userId, { count: 1, windowStart: now });
+      return false;
+    }
+    bucket.count += 1;
+    return bucket.count > max;
+  }
+
+  /** Send a rate-limit notice to a user, at most once per minute. */
+  function notifyRateLimited(account: WeixinAccount, userId: string, contextToken: string, sessionId: string): void {
+    const now = Date.now();
+    if ((rateLimitedNotifiedAt.get(userId) ?? 0) + 60_000 > now) return;
+    rateLimitedNotifiedAt.set(userId, now);
+    sendWeixinReply(api, account, userId, contextToken, sessionId,
+      "⏳ 消息发送过于频繁，请稍后再试。").catch(() => {});
+  }
+
+  // ── Fire-and-forget UI notification buffer (debounced merging) ───────
+  /** Accumulated notification lines waiting to be sent. */
+  const uiNotifyBuffer: string[] = [];
+  /** Routing context captured with the first buffered notification. */
+  let uiNotifyCtx: PendingContext | null = null;
+  let uiNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Flush buffered notifications as a single WeChat message. */
+  function flushUiNotifications(): void {
+    if (uiNotifyTimer) {
+      clearTimeout(uiNotifyTimer);
+      uiNotifyTimer = null;
+    }
+    if (uiNotifyBuffer.length === 0) return;
+    const batch = uiNotifyBuffer.splice(0);
+    const ctx = uiNotifyCtx;
+    uiNotifyCtx = null;
+    if (ctx) {
+      sendWeixinReply(
+        api, ctx.account, ctx.userId, ctx.contextToken, ctx.sessionId,
+        batch.join("\n"),
+      ).catch((err) => log(`[weixin] 通知合并发送失败: ${err}`));
+    }
+  }
+
+  /** Buffer a notification; consecutive ones are merged after 1.5s. */
+  function bufferUiNotification(ctx: PendingContext, text: string): void {
+    uiNotifyCtx = uiNotifyCtx ?? ctx;
+    uiNotifyBuffer.push(text);
+    if (uiNotifyTimer) return;
+    uiNotifyTimer = setTimeout(() => {
+      uiNotifyTimer = null;
+      flushUiNotifications();
+    }, 1500);
+  }
+
   /** Active poller instances (stopped/restarted during reconnect). */
   const pollers: Poller[] = [];
 
@@ -1021,6 +1135,7 @@ async function runDaemon(): Promise<void> {
       log(`[weixin] 收到消息但 Pi 未连接，丢弃: ${text.slice(0, 40)}...`);
       return;
     }
+    lastActivityAt = Date.now();
 
     const userId = msg.from_user_id ?? "";
     const contextToken = msg.context_token ?? "";
@@ -1030,6 +1145,20 @@ async function runDaemon(): Promise<void> {
     const allow = config.allowlist ?? [];
     if (allow.length > 0 && !allow.includes(userId)) {
       logDebug(`[weixin] 用户 ${userId} 不在白名单，忽略消息: ${text.slice(0, 40)}`);
+      return;
+    }
+
+    // ── Blocklist check ─────────────────────────────────────────────
+    const blocked = config.blocklist ?? [];
+    if (blocked.includes(userId)) {
+      logDebug(`[weixin] 用户 ${userId} 在黑名单，忽略消息`);
+      return;
+    }
+
+    // ── Rate limit (anti-spam) ──────────────────────────────────────
+    if (isRateLimited(userId)) {
+      logDebug(`[weixin] 用户 ${userId} 触发限流，丢弃消息: ${text.slice(0, 40)}`);
+      notifyRateLimited(account, userId, contextToken, sessionId);
       return;
     }
 
@@ -1477,6 +1606,11 @@ async function runDaemon(): Promise<void> {
       const aborted = event.aborted ?? false;
       const reply = extractAssistantReply(event.messages);
       const hasPending = pendingContext !== null;
+      lastActivityAt = Date.now();
+
+      // Deliver any buffered notifications before the turn's context is
+      // cleared (prevents them leaking into the next user's turn).
+      flushUiNotifications();
 
       log(`[rpc] agent_end | aborted=${aborted} hasPending=${hasPending} hasReply=${!!reply}`);
 
@@ -1554,19 +1688,12 @@ async function runDaemon(): Promise<void> {
       const method = event.method;
       log(`[rpc] extension_ui_request: method=${method} id=${event.id}`);
 
-      // ── Fire-and-forget: forward to WeChat if we have a pending context ──
+      // ── Fire-and-forget: merge into a debounced notification buffer ──
       if (isFireAndForget(method)) {
         if (pendingContext) {
           const formatted = formatUIRequestForWeixin(event);
           if (formatted) {
-            sendWeixinReply(
-              api,
-              pendingContext.account,
-              pendingContext.userId,
-              pendingContext.contextToken,
-              pendingContext.sessionId,
-              formatted,
-            ).catch((err) => log(`[weixin] 通知发送失败: ${err}`));
+            bufferUiNotification(pendingContext, formatted);
           }
         } else {
           log(`[rpc] 忽略 ${method} (无活跃微信会话)`);
@@ -1582,6 +1709,8 @@ async function runDaemon(): Promise<void> {
       }
 
       const ctx = pendingContext;
+      // Deliver any buffered notifications before asking the question
+      flushUiNotifications();
       const formatted = formatUIRequestForWeixin(event);
 
       // Send the question to WeChat
@@ -1840,6 +1969,10 @@ async function runDaemon(): Promise<void> {
   process.on("SIGTERM", () => {
     shutdown("SIGTERM").catch(() => {});
   });
+
+  // ── Start status heartbeat ──────────────────────────────────────────
+  writeStatusHeartbeat();
+  setInterval(writeStatusHeartbeat, 5_000).unref();
 
   log("pi-weixin-hub RPC 模式已启动，等待微信消息...");
 }

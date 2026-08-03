@@ -3,6 +3,9 @@
 // Invoked when the binary is called with arguments (other than "daemon").
 
 import process from "node:process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { startQRLogin } from "./auth.js";
 import { WeixinApi } from "./api.js";
@@ -41,6 +44,8 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   enabled            消息接收开关 (true/false)
   defaultModel       默认模型 ("provider/modelId" 或模型名，空=使用 Pi 默认)
   allowlist          允许的用户 ID，逗号分隔（空=允许所有）
+  blocklist          拉黑的用户 ID，逗号分隔（空=无）
+  rateLimitMax       每用户每分钟消息上限 (0=不限)
   groupChat          群聊模式 (true/false)
   botName            群聊 @ 触发昵称 (如 "mybot"，空=处理所有群消息)
   maxReplyLength     单条回复最大字符数 (0=不拆分)
@@ -143,16 +148,19 @@ function handleLogout(args: string[]): number {
   return 0;
 }
 
-/** status — 显示所有已保存的账号。 */
+/** status — 显示 daemon 状态 + 所有已保存的账号。 */
 function handleStatus(): number {
+  process.stdout.write("── Daemon 状态 ──\n\n");
+  process.stdout.write(`${formatDaemonStatus()}\n\n`);
+
   const accounts = loadAccounts();
 
   if (accounts.length === 0) {
-    process.stdout.write("没有已登录的账号。\n");
+    process.stdout.write("── 账号 ──\n\n没有已登录的账号。\n");
     return 0;
   }
 
-  process.stdout.write(`已保存 ${accounts.length} 个账号:\n\n`);
+  process.stdout.write(`── 账号（${accounts.length}）──\n\n`);
   for (const a of accounts) {
     process.stdout.write(`  ID:        ${a.id}\n`);
     process.stdout.write(`  User ID:   ${a.userId}\n`);
@@ -161,6 +169,56 @@ function handleStatus(): number {
     process.stdout.write("\n");
   }
   return 0;
+}
+
+/** Read the daemon heartbeat file and render a dashboard panel. */
+function formatDaemonStatus(): string {
+  try {
+    const filePath = path.join(os.homedir(), ".config", "pi-weixin-cli", "daemon-status.json");
+    if (!fs.existsSync(filePath)) {
+      return "（未检测到 daemon 状态文件 — daemon 可能未运行）";
+    }
+    const st = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Record<string, unknown>;
+    const pid = st.pid as number | undefined;
+    const alive = pid ? isProcessAlive(pid) : false;
+
+    const lines: string[] = [
+      alive ? "🟢 daemon 运行中" : "🔴 daemon 未运行（状态文件可能已过期）",
+      `  PID:          ${pid ?? "?"}`,
+      `  版本:         ${(st.version as string) ?? "?"}`,
+      `  运行时长:     ${fmtUptime((st.uptimeSec as number) ?? 0)}`,
+      `  账号:         ${((st.accounts as string[]) ?? []).join(", ") || "(无)"}`,
+      `  当前会话:     ${(st.sessionOwner as string) ?? "(无)"}`,
+      `  待处理队列:   ${(st.queueLength as number) ?? 0} 条`,
+      `  Pi 进程:      ${st.piRunning ? "运行中" : "未运行"}`,
+    ];
+    if (st.lastActivityAt) {
+      lines.push(`  最近活动:     ${formatTime(st.lastActivityAt as number)}`);
+    }
+    return lines.join("\n");
+  } catch {
+    return "（读取 daemon 状态失败）";
+  }
+}
+
+/** Whether a PID is currently alive (signal 0 probe). */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Format uptime seconds as human-readable duration. */
+function fmtUptime(sec: number): string {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
 /** toggle — 切换全局消息接收开关。 */

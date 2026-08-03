@@ -67,7 +67,7 @@ const ILINK_APP_CLIENT_VERSION = buildClientVersion();
 export function buildBaseInfo(): BaseInfo {
   return {
     channel_version: CHANNEL_VERSION,
-    bot_agent: "pi-weixin-hub/0.4.0",
+    bot_agent: "pi-weixin-hub/0.5.0",
   };
 }
 
