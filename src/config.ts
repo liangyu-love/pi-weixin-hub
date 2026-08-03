@@ -354,6 +354,9 @@ export function describeConfig(config: WeixinConfig): string {
   label("typingIndicator", config.typingIndicator ? "启用" : "禁用");
   label("visionSubagent", config.visionSubagent ?? "vision");
   label("attachImages", config.attachImages ? "启用" : "禁用（走 vision 子代理）");
+  label("autoConvertDocuments", config.autoConvertDocuments !== false ? "启用（MarkItDown）" : "禁用");
+  label("documentMaxChars", `${config.documentMaxChars ?? 8000} 字符`);
+  label("documentMaxMb", `${config.documentMaxMb ?? 20}MB`);
   label("autoConvertDocuments", config.autoConvertDocuments ? "启用" : "禁用");
   label("documentMaxChars", config.documentMaxChars ? `${config.documentMaxChars} 字符` : "(0=不限)");
   label("documentMaxMb", `${config.documentMaxMb ?? 20} MB`);
