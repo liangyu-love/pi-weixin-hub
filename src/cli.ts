@@ -1,5 +1,5 @@
 // ── CLI Command Handler ─────────────────────────────────────────────────
-// Implements all CLI subcommands for pi-weixin-cli standalone mode.
+// Implements all CLI subcommands for pi-weixin-hub standalone mode.
 // Invoked when the binary is called with arguments (other than "daemon").
 
 import process from "node:process";
@@ -14,14 +14,16 @@ import {
   loadConfig,
   saveConfig,
   resetConfig,
+  setConfigValue,
+  describeConfig,
 } from "./config.js";
 
 // ── Help ──────────────────────────────────────────────────────────────
 
-const HELP = `pi-weixin-cli — 微信消息桥接工具
+const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分支增强版）
 
 用法:
-  pi-weixin-cli [命令]
+  pi-weixin-hub [命令]
 
 命令:
   login              使用手机微信扫描二维码登录账号
@@ -29,10 +31,24 @@ const HELP = `pi-weixin-cli — 微信消息桥接工具
   status             显示所有已登录账号及其状态
   toggle             切换消息接收功能（启用/禁用）
   config show        显示当前配置
+  config set <k> <v> 修改配置项（如 allowlist、groupChat、maxReplyLength）
   config reset       恢复默认配置
   --help, -h         显示此帮助信息
 
 不传任何参数则启动 daemon 模式（后台消息轮询）。
+
+可用配置项:
+  enabled            消息接收开关 (true/false)
+  defaultModel       默认模型 ("provider/modelId" 或模型名，空=使用 Pi 默认)
+  allowlist          允许的用户 ID，逗号分隔（空=允许所有）
+  groupChat          群聊模式 (true/false)
+  maxReplyLength     单条回复最大字符数 (0=不拆分)
+  replyPrefix        AI 回复前缀 (如 "🤖 ")
+  logLevel           日志级别 (debug/info/warn/error)
+  persistentSession  重启后恢复上下文 (true/false)
+  visionAgent        图片分析走 vision 子代理 (true/false)
+  visionSubagent     vision 子代理名称 (默认 vision)
+  attachImages       图片以 base64 直接附加 (true/false)
 `;
 
 function printHelp(): void {
@@ -121,8 +137,8 @@ function handleLogout(args: string[]): number {
   for (const a of accounts) {
     process.stdout.write(`  ${a.id}\n`);
   }
-  process.stdout.write("\n用法: pi-weixin-cli logout <账号ID>\n");
-  process.stdout.write("  或: pi-weixin-cli logout --all    (删除全部)\n");
+  process.stdout.write("\n用法: pi-weixin-hub logout <账号ID>\n");
+  process.stdout.write("  或: pi-weixin-hub logout --all    (删除全部)\n");
   return 0;
 }
 
@@ -170,22 +186,47 @@ function handleConfig(args: string[]): number {
   switch (sub) {
     case "show":
       return handleConfigShow();
+    case "set":
+      return handleConfigSet(args.slice(1));
     case "reset":
       return handleConfigReset();
     default: {
       process.stderr.write(`错误: 未知的 config 子命令 "${sub ?? "(无)"}"。\n\n`);
       process.stdout.write("可用子命令:\n");
-      process.stdout.write("  show   显示当前配置\n");
-      process.stdout.write("  reset  恢复默认配置\n");
+      process.stdout.write("  show              显示当前配置\n");
+      process.stdout.write("  set <key> <value> 修改配置项\n");
+      process.stdout.write("  reset             恢复默认配置\n");
+      process.stdout.write('运行 "pi-weixin-hub --help" 查看全部配置项。\n');
       return 1;
     }
   }
 }
 
+function handleConfigSet(args: string[]): number {
+  const key = args[0];
+  const value = args[1];
+
+  if (!key || value === undefined) {
+    process.stderr.write("用法: pi-weixin-hub config set <key> <value>\n");
+    return 1;
+  }
+
+  const config = loadConfig();
+  const err = setConfigValue(config, key, value);
+  if (err) {
+    process.stderr.write(`错误: ${err}\n`);
+    return 1;
+  }
+
+  saveConfig(config);
+  process.stdout.write(`已设置 ${key} = ${value}\n`);
+  return 0;
+}
+
 function handleConfigShow(): number {
   const config = loadConfig();
   process.stdout.write("当前配置:\n\n");
-  process.stdout.write(`  消息接收:  ${config.enabled ? "启用" : "禁用"}\n`);
+  process.stdout.write(`${describeConfig(config)}\n`);
   return 0;
 }
 
@@ -230,7 +271,7 @@ export async function runCLI(args: string[]): Promise<number> {
       process.stderr.write(
         `未知命令: ${cmd ?? "(无)"}\n`,
       );
-      process.stderr.write('运行 "pi-weixin-cli --help" 查看可用命令。\n');
+      process.stderr.write('运行 "pi-weixin-hub --help" 查看可用命令。\n');
       return 1;
     }
   }

@@ -1,9 +1,9 @@
 {
-  "name": "pi-weixin-cli",
-  "version": "0.3.0",
+  "name": "pi-weixin-hub",
+  "version": "0.4.0",
   "private": false,
   "type": "module",
-  "description": "Weixin (WeChat) bridge for Pi Agent — bidirectional message relay via RPC with full UI interaction support",
+  "description": "Weixin (WeChat) bridge for Pi Agent — enhanced fork of pi-weixin-cli with vision image analysis, persistent sessions, allowlist, group chat mode, and WeChat-optimized replies",
   "keywords": [
     "pi",
     "weixin",
@@ -11,9 +11,12 @@
     "agent",
     "rpc",
     "bridge",
-    "bot"
+    "bot",
+    "vision",
+    "hub"
   ],
   "bin": {
+    "pi-weixin-hub": "dist/main.js",
     "pi-weixin-cli": "dist/main.js"
   },
   "files": [

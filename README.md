@@ -1,8 +1,12 @@
-# pi-weixin-cli
+# pi-weixin-hub
+
+> **本项目是 [pi-weixin-cli](https://github.com/Guanzhw/pi-weixin-cli) v0.3.0 的增强分支（fork）。**
+> 在保留原版全部功能的基础上，增加了视觉图片分析、持久会话、白名单、群聊模式、
+> 微信友好回复格式化与分类错误提示等能力。仓库：[liangyu-love/pi-weixin-hub](https://github.com/liangyu-love/pi-weixin-hub)
 
 微信消息桥接工具 — 将微信消息与 [Pi Agent](https://github.com/earendil-works/pi-coding-agent) 双向连通。
 
-pi-weixin-cli 是一个**独立可执行程序**，通过 spawn `pi --mode rpc` 子进程并使用 JSONL stdin/stdout 协议与 Pi 通信。你在微信中发送的消息会转发给 Pi，Pi 的回复自动发送回微信。
+pi-weixin-hub 是一个**独立可执行程序**，通过 spawn `pi --mode rpc` 子进程并使用 JSONL stdin/stdout 协议与 Pi 通信。你在微信中发送的消息会转发给 Pi，Pi 的回复自动发送回微信。
 
 ## 系统要求
 
@@ -14,28 +18,28 @@ pi-weixin-cli 是一个**独立可执行程序**，通过 spawn `pi --mode rpc` 
 ### 方式一：npm 全局安装（推荐，最简单）
 
 ```bash
-npm install -g pi-weixin-cli
+npm install -g pi-weixin-hub
 ```
 
 安装后即可在任何目录直接使用：
 
 ```bash
-pi-weixin-cli --help
-pi-weixin-cli login
-pi-weixin-cli status
-pi-weixin-cli          # 启动 daemon
+pi-weixin-hub --help
+pi-weixin-hub login
+pi-weixin-hub status
+pi-weixin-hub          # 启动 daemon
 ```
 
 升级：
 ```bash
-npm update -g pi-weixin-cli
+npm update -g pi-weixin-hub
 ```
 
 ### 方式二：从源码安装（开发或自定义）
 
 ```bash
 git clone https://github.com/liangyu-love/pi-weixin-hub.git
-cd pi-weixin-cli
+cd pi-weixin-hub
 npm install
 npm run build
 npm link
@@ -44,22 +48,22 @@ npm link
 ### 方式三：npx 直接运行（无需安装）
 
 ```bash
-npx pi-weixin-cli login
-npx pi-weixin-cli status
-npx pi-weixin-cli      # 启动 daemon
+npx pi-weixin-hub login
+npx pi-weixin-hub status
+npx pi-weixin-hub      # 启动 daemon
 ```
 
 ## 快速开始
 
 ```bash
 # 1. 登录微信机器人账号（终端显示二维码，用微信扫码确认）
-pi-weixin-cli login
+pi-weixin-hub login
 
 # 2. 启动 daemon 模式（后台消息轮询 + Pi RPC 通信）
-pi-weixin-cli
+pi-weixin-hub
 
 # 或者显式启动：
-pi-weixin-cli daemon
+pi-weixin-hub daemon
 ```
 
 启动后，脚本会自动 spawn `pi --mode rpc` 子进程，并通过 JSONL 协议维持通信。当有微信消息到达时转发给 Pi，Pi 的回复自动发送回微信。
@@ -68,12 +72,12 @@ pi-weixin-cli daemon
 
 **从 npm 全局安装：**
 ```bash
-npm update -g pi-weixin-cli
+npm update -g pi-weixin-hub
 ```
 
 **从源码安装：**
 ```bash
-cd pi-weixin-cli
+cd pi-weixin-hub
 git pull              # 更新代码
 npm install           # 更新依赖
 npm run build         # 重新编译
@@ -123,16 +127,17 @@ Weixin Backend (ilinkai.weixin.qq.com)
 
 | 命令 | 说明 |
 |------|------|
-| `pi-weixin-cli` | 启动 daemon 模式（默认） |
-| `pi-weixin-cli daemon` | 同上的显式写法 |
-| `pi-weixin-cli login` | 扫描二维码登录微信机器人账号 |
-| `pi-weixin-cli logout [id]` | 登出指定账号；不指定 id 时列出所有账号 |
-| `pi-weixin-cli logout --all` | 删除所有已登录账号 |
-| `pi-weixin-cli status` | 显示所有已保存账号的信息 |
-| `pi-weixin-cli toggle` | 启用/禁用消息接收 |
-| `pi-weixin-cli config show` | 显示当前配置 |
-| `pi-weixin-cli config reset` | 恢复默认配置 |
-| `pi-weixin-cli --help` | 显示帮助信息 |
+| `pi-weixin-hub` / `pi-weixin-cli` | 启动 daemon 模式（默认，两个命令均可） |
+| `pi-weixin-hub daemon` | 同上的显式写法 |
+| `pi-weixin-hub login` | 扫描二维码登录微信机器人账号 |
+| `pi-weixin-hub logout [id]` | 登出指定账号；不指定 id 时列出所有账号 |
+| `pi-weixin-hub logout --all` | 删除所有已登录账号 |
+| `pi-weixin-hub status` | 显示所有已保存账号的信息 |
+| `pi-weixin-hub toggle` | 启用/禁用消息接收 |
+| `pi-weixin-hub config show` | 显示当前配置 |
+| `pi-weixin-hub config set <k> <v>` | 修改配置项（如 `config set allowlist uid1,uid2`） |
+| `pi-weixin-hub config reset` | 恢复默认配置 |
+| `pi-weixin-hub --help` | 显示帮助信息 |
 
 ## 微信内斜线命令
 
@@ -180,11 +185,17 @@ pi-weixin-cli 支持将 Pi 的终端交互操作桥接到微信：
 
 ### 图片消息支持
 
-pi-weixin-cli 支持接收微信图片并转发给 Pi：
+pi-weixin-hub 支持接收微信图片并自动触发 **vision 视觉分析**：
 - 微信图片下载后保存到 `~/.config/pi-weixin-cli/images/`
 - 在 prompt 中告知 Pi 图片的本地文件路径，Pi 可自行用 `read` 或 vision 工具处理
+- **视觉子代理（默认开启）**：收到图片时，自动指示 Pi 调用 `vision` 子代理
+  （`~/.pi/agent/agents/vision.md`，使用多模态模型如 gpt-5.6-luna）分析图片，
+  文本模型也能“看懂”图片内容
 - 支持 WeChat CDN 加密图片的自动解密（AES-128-ECB）
 - 纯图片消息也会被处理，不依赖文字内容
+
+> 若你的默认模型本身支持图片输入，可将 `attachImages` 设为 `true`，图片会以
+> base64 直接附加到 prompt（无需子代理）；或将 `visionAgent` 设为 `false` 关闭自动分析。
 
 示例：用户发送一张图片，Pi 收到的消息为：
 
@@ -261,15 +272,36 @@ pi-weixin-cli 支持接收微信视频消息：
 
 ```json
 {
-  "enabled": true
+  "enabled": true,
+  "defaultModel": "",
+  "allowlist": [],
+  "groupChat": false,
+  "maxReplyLength": 2000,
+  "replyPrefix": "🤖 ",
+  "logLevel": "info",
+  "persistentSession": true,
+  "visionAgent": true,
+  "visionSubagent": "vision",
+  "attachImages": false
 }
 ```
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `enabled` | boolean | `true` | daemon 启动时是否启用消息接收 |
+| `defaultModel` | string | `""` | 启动时切换到的默认模型（`provider/modelId` 或模型名） |
+| `allowlist` | string[] | `[]` | 允许使用 bot 的用户 ID 列表；空 = 允许所有用户 |
+| `groupChat` | boolean | `false` | 是否响应群聊消息 |
+| `maxReplyLength` | number | `2000` | 单条回复最大字符数，超过自动拆分（`0` = 不拆分） |
+| `replyPrefix` | string | `"🤖 "` | AI 回复的 emoji 状态前缀 |
+| `logLevel` | string | `"info"` | 日志级别：`debug` / `info` / `warn` / `error` |
+| `persistentSession` | boolean | `true` | 重启 daemon 后自动恢复上次的会话上下文 |
+| `visionAgent` | boolean | `true` | 收到图片时指示 Pi 调用 vision 子代理分析 |
+| `visionSubagent` | string | `"vision"` | vision 子代理名称 |
+| `attachImages` | boolean | `false` | 图片以 base64 直接附加到 prompt（视觉模型） |
 
-所有配置项都可通过 `config` 命令动态修改，无需重启 daemon（下次启动时生效）。
+所有配置项都可通过 `config set` 命令动态修改（如 `pi-weixin-hub config set logLevel debug`），
+下次启动时生效。日志级别也可用 `LOG_LEVEL` 环境变量覆盖（优先级更高）。
 
 ## 数据目录
 
@@ -278,7 +310,8 @@ pi-weixin-cli 支持接收微信视频消息：
 | 目录/文件 | 说明 |
 |-----------|------|
 | `accounts.json` | 已登录的微信机器人账号（botToken, userId, baseUrl） |
-| `context-tokens.json` | 每个用户的 sync context token（用于 getUpdates 游标） |
+| `context-tokens/` | 每个用户的 sync context token（用于 getUpdates 游标） |
+| `<account>-last-session.json` | 持久会话记录（上次的 Pi session 文件路径） |
 | `images/` | 收到的微信图片 |
 | `files/` | 收到的微信文件 |
 | `voices/` | 收到的微信语音消息 |
@@ -286,9 +319,9 @@ pi-weixin-cli 支持接收微信视频消息：
 
 ## 限制（当前版本）
 
-- **纯文本回复**：Pi 的回复以纯文本发送，不支持 Markdown 渲染或富文本
+- **纯文本回复**：Pi 的回复经格式化（代码块、列表、长文本拆分）后以纯文本发送，不支持 Markdown 渲染
 - **单会话处理**：消息按 FIFO 顺序逐条处理，Pi 同一时间只处理一条微信消息
-- **无会话隔离**：所有微信消息注入同一个 Pi RPC 会话，不同微信用户共享 Pi 上下文
+- **无会话隔离**：所有微信消息注入同一个 Pi RPC 会话（多用户会话隔离见开发计划 Phase 2）
 - **需要常驻终端**：daemon 模式在前台运行（非 systemd service），关闭终端即停止
 - **bash 结果延迟可见**：`!command` 的结果在 Pi 内部静默存储，需**下一次用户消息**触发后 AI 才能看到（RPC 协议设计）
 

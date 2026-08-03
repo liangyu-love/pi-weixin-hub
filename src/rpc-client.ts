@@ -11,6 +11,9 @@
 // is NOT used because it also splits on U+2028/U+2029, violating JSONL spec.
 
 import { spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
 import { EventEmitter } from "node:events";
 import type {
   RpcStdinCommand,
@@ -29,8 +32,99 @@ import type {
 
 const DEFAULT_PI_PATH = "/home/qq110/.npm-global/bin/pi";
 
+// ── Pi executable resolution ────────────────────────────────────────────
+
+/** A resolved spawn target: an executable plus optional leading args. */
+interface ResolvedTarget {
+  command: string;
+  args: string[];
+}
+
+/** PATH entries, split per platform. */
+function pathEntries(): string[] {
+  const raw = process.env.PATH ?? "";
+  return raw.split(path.delimiter).filter(Boolean);
+}
+
+/** Find `pi` (or pi.exe/.cmd/.bat on Windows) on PATH. */
+function findPiOnPath(): string | null {
+  const isWin = process.platform === "win32";
+  const names = isWin ? ["pi.exe", "pi.cmd", "pi.bat", "pi"] : ["pi"];
+  for (const dir of pathEntries()) {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      try {
+        if (fs.existsSync(candidate)) return candidate;
+      } catch {
+        /* keep searching */
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve how to launch the `pi` CLI:
+ *   1. PI_PATH env var (spawned directly)
+ *   2. Hardcoded upstream Linux install path, if present locally
+ *   3. `pi` found on PATH — derive the real Node entry
+ *      (node_modules/@earendil-works/pi-coding-agent/dist/cli.js) and
+ *      spawn `node <cli.js>`; this works for npm/scoop shims (pi.cmd)
+ *      that Node's spawn cannot execute directly on Windows.
+ */
+function resolvePiTarget(piPath?: string): ResolvedTarget {
+  const explicit = piPath ?? process.env.PI_PATH;
+  if (explicit) {
+    return { command: explicit, args: [] };
+  }
+
+  try {
+    if (fs.existsSync(DEFAULT_PI_PATH)) {
+      return { command: DEFAULT_PI_PATH, args: [] };
+    }
+  } catch {
+    /* fall through */
+  }
+
+  const found = findPiOnPath();
+  if (found) {
+    const base = path.dirname(found);
+    const cliJs = path.join(
+      base,
+      "node_modules",
+      "@earendil-works",
+      "pi-coding-agent",
+      "dist",
+      "cli.js",
+    );
+    try {
+      if (fs.existsSync(cliJs)) {
+        return { command: process.execPath, args: [cliJs] };
+      }
+    } catch {
+      /* fall through */
+    }
+    return { command: found, args: [] };
+  }
+
+  // Last resort: let the OS resolve "pi" (works when shell is involved).
+  return { command: "pi", args: [] };
+}
+
 /** Max accumulated stderr bytes to retain for diagnostics. */
 const MAX_STDERR_BYTES = 64 * 1024;
+
+// ── Spawn options ────────────────────────────────────────────────────────
+
+/** Options controlling how the Pi RPC subprocess is spawned. */
+export interface RpcSpawnOptions {
+  /**
+   * Whether to persist the Pi session across restarts.
+   * true  → omit `--no-session` (Pi saves the session, can be resumed).
+   * false → pass `--no-session` (ephemeral, context is discarded on exit).
+   */
+  persistentSession?: boolean;
+}
 
 // ── Event payload types for strongly-typed listeners ──────────────────
 
@@ -58,6 +152,8 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
   private stderrAcc = "";
   private _isStreaming = false;
   private readonly piPath: string;
+  private readonly persistentSession: boolean;
+  private readonly spawnTarget: ResolvedTarget;
 
   /** Pending requests awaiting a response event, keyed by request id. */
   private pendingRequests = new Map<
@@ -66,9 +162,11 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
   >();
   private requestIdCounter = 0;
 
-  constructor(piPath?: string) {
+  constructor(piPath?: string, opts: RpcSpawnOptions = {}) {
     super();
-    this.piPath = piPath ?? process.env.PI_PATH ?? DEFAULT_PI_PATH;
+    this.spawnTarget = resolvePiTarget(piPath);
+    this.piPath = this.spawnTarget.command;
+    this.persistentSession = opts.persistentSession ?? true;
   }
 
   // ── Public accessors ─────────────────────────────────────────────────
@@ -102,7 +200,11 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
     }
 
     return new Promise<void>((resolve, reject) => {
-      const child = spawn(this.piPath, ["--mode", "rpc"], {
+      const args = [...this.spawnTarget.args, "--mode", "rpc"];
+      if (!this.persistentSession) {
+        args.push("--no-session");
+      }
+      const child = spawn(this.spawnTarget.command, args, {
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
       });

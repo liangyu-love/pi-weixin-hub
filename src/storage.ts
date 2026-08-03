@@ -124,6 +124,47 @@ function deleteSyncState(accountId: string): void {
   }
 }
 
+// ── Persistent Session Storage (per-account) ───────────────────────────
+
+const SESSION_FILE = "last-session.json";
+
+function sessionFilePath(accountId: string): string {
+  return path.join(getStateDir(), `${safeId(accountId)}-${SESSION_FILE}`);
+}
+
+/** Load the last-known Pi session file path for an account, or null. */
+export function loadSavedSession(accountId: string): string | null {
+  try {
+    const filePath = sessionFilePath(accountId);
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, "utf-8").trim();
+    return raw || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Save the Pi session file path for an account (for resume after restart). */
+export function saveSavedSession(accountId: string, sessionPath: string): void {
+  try {
+    const filePath = sessionFilePath(accountId);
+    ensureDir(path.dirname(filePath));
+    fs.writeFileSync(filePath, sessionPath, "utf-8");
+  } catch {
+    // ignore
+  }
+}
+
+/** Clear the saved Pi session file path for an account. */
+export function clearSavedSession(accountId: string): void {
+  try {
+    const filePath = sessionFilePath(accountId);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {
+    // ignore
+  }
+}
+
 // ── Context Token Storage (per-account, per-user) ──────────────────────
 
 const CTX_TOKEN_DIR = "context-tokens";

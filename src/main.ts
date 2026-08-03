@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ── pi-weixin-cli RPC Entry Point ──────────────────────────────────────
+// ── pi-weixin-hub RPC Entry Point ──────────────────────────────────────
 // Standalone process that bridges WeChat messages to Pi via RPC protocol.
 //
 // Architecture:
@@ -10,7 +10,8 @@
 //           → UIBridge (extension_ui_request ↔ WeChat messages)
 //         → WeixinApi.sendMessage (reply back to WeChat)
 //
-// The RPC client spawns `pi --mode rpc --no-session` and communicates
+// The RPC client spawns `pi --mode rpc` (sessions persist by default;
+// set persistentSession=false to add --no-session) and communicates
 // via JSONL on stdin/stdout. Each WeChat message becomes a `prompt`
 // command, and the assistant's reply is extracted from the `agent_end`
 // event and sent back to the WeChat user.
@@ -32,12 +33,15 @@ import os from "node:os";
 import { WeixinApi } from "./api.js";
 import { Poller, type MessageCallback, type LogCallback } from "./poller.js";
 import { RpcClient } from "./rpc-client.js";
-import { loadAccounts, saveContextToken, loadContextTokens } from "./storage.js";
+import { loadAccounts, saveContextToken, loadContextTokens, loadSavedSession, saveSavedSession } from "./storage.js";
 import { loadConfig } from "./config.js";
+import { Logger, resolveLogLevel } from "./logger.js";
+import { formatAndSplit } from "./format-reply.js";
+import { classifyError, formatClassifiedError } from "./error-classifier.js";
 import type { WeixinAccount, ImageItem, FileItem, VoiceItem, VideoItem } from "./types.js";
 import { MessageItemType, MessageType, MessageState } from "./types.js";
-import type { AgentEndEvent, ExtensionUIRequestEvent } from "./types-rpc.js";
-import { saveImageLocally, saveFileLocally, saveVoiceLocally, saveVideoLocally } from "./media-handler.js";
+import type { AgentEndEvent, ExtensionUIRequestEvent, ImageContent } from "./types-rpc.js";
+import { processImageForPi, saveImageLocally, saveFileLocally, saveVoiceLocally, saveVideoLocally } from "./media-handler.js";
 import { StateMachine, type UIMethod, type UIRequestContext } from "./state-machine.js";
 import { formatUIRequestForWeixin, isFireAndForget, parseUserResponse } from "./ui-bridge.js";
 import { runCLI } from "./cli.js";
@@ -137,28 +141,28 @@ async function sendWeixinReply(
     );
     log(`[weixin] 回复已发送 (${replyText.length} 字符) → ${toUserId}`);
   } catch (err) {
-    log(
-      `[weixin] 回复发送失败: ${err instanceof Error ? err.message : String(err)}`,
-    );
+    const cls = classifyError(err);
+    logWarn(`[weixin] 回复发送失败: ${err instanceof Error ? err.message : String(err)} (${cls.category})`);
   }
 }
 
 // ── Logging ────────────────────────────────────────────────────────────
 
+const logger = new Logger("info", "daemon");
+
+/** Info-level log (kept as a bare function so existing call sites stay short). */
 function log(msg: string): void {
-  const ts = toLocalISOString(new Date());
-  process.stderr.write(`[${ts}] ${msg}\n`);
+  logger.info(msg);
 }
 
-function toLocalISOString(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  const off = -d.getTimezoneOffset();
-  const sign = off >= 0 ? "+" : "-";
-  const abs = Math.abs(off);
-  const tz = `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T` +
-    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.` +
-    `${String(d.getMilliseconds()).padStart(3, "0")}${tz}`;
+/** Debug-level log — only visible when logLevel=debug. */
+function logDebug(msg: string): void {
+  logger.debug(msg);
+}
+
+/** Warn-level log. */
+function logWarn(msg: string): void {
+  logger.warn(msg);
 }
 
 // ── Slash Command Type ─────────────────────────────────────────────────
@@ -175,15 +179,74 @@ interface BashCommand {
 // ── Daemon ─────────────────────────────────────────────────────────────
 
 async function runDaemon(): Promise<void> {
-  log("pi-weixin-cli RPC 模式启动中...");
+  log("pi-weixin-hub RPC 模式启动中...");
   const daemonCwd = process.cwd();
 
   // ── Load config ──────────────────────────────────────────────────────
   const config = loadConfig();
+  logger.setLevel(resolveLogLevel(config.logLevel));
+
+  // ── Default model + persistent session helpers ───────────────────────
+
+  /**
+   * Apply config.defaultModel to the given RPC client (best effort).
+   * Accepts "provider/modelId" or a bare model id/name.
+   */
+  async function applyDefaultModel(client: RpcClient): Promise<void> {
+    const model = config.defaultModel;
+    if (!model) return;
+    try {
+      if (model.includes("/")) {
+        const [provider, modelId] = model.split("/", 2);
+        await client.setModel(provider, modelId);
+        log(`[rpc] 默认模型已应用: ${model}`);
+      } else {
+        const result = (await client.getAvailableModels()) as {
+          models?: Array<Record<string, unknown>>;
+        } | null;
+        const models = result?.models ?? [];
+        const found = models.find(
+          (m) => (m.id ?? m.modelId ?? m.name) === model,
+        ) as Record<string, unknown> | undefined;
+        if (found) {
+          await client.setModel(
+            (found.provider as string) ?? "",
+            (found.id ?? found.modelId) as string,
+          );
+          log(`[rpc] 默认模型已应用: ${(found.name ?? found.id) as string}`);
+        } else {
+          logWarn(`[rpc] 默认模型 ${model} 不在可用模型列表中，跳过`);
+        }
+      }
+    } catch (err) {
+      logWarn(`[rpc] 应用默认模型失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Resume the last-known Pi session file for an account (best effort).
+   * Only the first account with an existing session file is restored,
+   * since the daemon shares a single RPC process.
+   */
+  async function resumePersistedSession(client: RpcClient): Promise<void> {
+    if (!config.persistentSession) return;
+    for (const account of accounts) {
+      const saved = loadSavedSession(account.id);
+      if (saved && fs.existsSync(saved)) {
+        try {
+          await client.switchSession(saved);
+          log(`[rpc] 已恢复 ${account.id} 的持久会话: ${saved}`);
+        } catch (err) {
+          logWarn(`[rpc] 恢复会话失败 (${account.id}): ${err instanceof Error ? err.message : String(err)}`);
+        }
+        break;
+      }
+    }
+  }
 
   // ── Respect config.enabled ───────────────────────────────────────────
   if (!config.enabled) {
-    log("配置中消息接收已禁用。使用 'pi-weixin-cli toggle' 启用。");
+    log("配置中消息接收已禁用。使用 'pi-weixin-hub toggle' 启用。");
     process.exit(0);
   }
 
@@ -192,7 +255,7 @@ async function runDaemon(): Promise<void> {
 
   if (accounts.length === 0) {
     log("错误: 没有已登录的微信账号。");
-    log("请先使用 'pi-weixin-cli login' 命令登录，或手动编辑 accounts.json。");
+    log("请先使用 'pi-weixin-hub login' 命令登录，或手动编辑 accounts.json。");
     log("账号文件位于: ~/.config/pi-weixin-cli/accounts.json");
     process.exit(1);
   }
@@ -712,14 +775,14 @@ async function runDaemon(): Promise<void> {
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log(`[slash] 命令 /${cmd.command} 执行失败: ${errMsg}`);
+      logWarn(`[slash] 命令 /${cmd.command} 执行失败: ${errMsg}`);
       await sendWeixinReply(
         api,
         account,
         userId,
         contextToken,
         sessionId,
-        `❌ 命令 /${cmd.command} 执行失败: ${errMsg}`,
+        formatClassifiedError(err),
       ).catch(() => {});
     }
   }
@@ -762,20 +825,23 @@ async function runDaemon(): Promise<void> {
 
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      log(`[bash] 执行失败: ${errMsg}`);
+      logWarn(`[bash] 执行失败: ${errMsg}`);
       await sendWeixinReply(
         api,
         account,
         userId,
         contextToken,
         sessionId,
-        `❌ 命令执行失败: ${errMsg}`,
+        formatClassifiedError(err),
       ).catch(() => {});
     }
   }
 
   /** Whether we're currently processing a WeChat-triggered agent turn. */
   let processingWeixin = false;
+
+  /** Text of the most recent RPC/agent error, used to classify failed turns. */
+  let lastAgentError: string | null = null;
 
   /** Active poller instances (stopped/restarted during reconnect). */
   const pollers: Poller[] = [];
@@ -796,6 +862,19 @@ async function runDaemon(): Promise<void> {
     const userId = msg.from_user_id ?? "";
     const contextToken = msg.context_token ?? "";
     const sessionId = msg.session_id ?? "";
+
+    // ── Allowlist check ─────────────────────────────────────────────
+    const allow = config.allowlist ?? [];
+    if (allow.length > 0 && !allow.includes(userId)) {
+      logDebug(`[weixin] 用户 ${userId} 不在白名单，忽略消息: ${text.slice(0, 40)}`);
+      return;
+    }
+
+    // ── Group chat mode check ───────────────────────────────────────
+    if (msg.group_id && !config.groupChat) {
+      logDebug(`[weixin] 群聊消息 (group=${msg.group_id}) 已忽略（groupChat=false）`);
+      return;
+    }
 
     // Save context token for this user (must echo verbatim in replies)
     if (userId && contextToken) {
@@ -833,14 +912,14 @@ async function runDaemon(): Promise<void> {
             log(`[slash] 模型已切换: ${name} (user=${userId})`);
           } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err);
-            log(`[slash] 切换模型失败: ${errMsg}`);
+            logWarn(`[slash] 切换模型失败: ${errMsg}`);
             await sendWeixinReply(
               api,
               account,
               userId,
               latestToken,
               sessionId,
-              `❌ 切换模型失败: ${errMsg}`,
+              formatClassifiedError(err),
             ).catch(() => {});
           }
         })();
@@ -873,10 +952,10 @@ async function runDaemon(): Promise<void> {
             log(`[slash] session 已切换: ${session.path} (user=${userId})`);
           } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err);
-            log(`[slash] 切换 session 失败: ${errMsg}`);
+            logWarn(`[slash] 切换 session 失败: ${errMsg}`);
             await sendWeixinReply(
               api, account, userId, latestToken, sessionId,
-              `❌ 切换 session 失败: ${errMsg}`,
+              formatClassifiedError(err),
             ).catch(() => {});
           }
         })();
@@ -910,10 +989,10 @@ async function runDaemon(): Promise<void> {
             log(`[slash] fork 完成: ${forkMsg.entryId} (user=${userId})`);
           } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err);
-            log(`[slash] fork 失败: ${errMsg}`);
+            logWarn(`[slash] fork 失败: ${errMsg}`);
             await sendWeixinReply(
               api, account, userId, latestToken, sessionId,
-              `❌ Fork 失败: ${errMsg}`,
+              formatClassifiedError(err),
             ).catch(() => {});
           }
         })();
@@ -1012,6 +1091,9 @@ async function runDaemon(): Promise<void> {
     let imagePath: string | null = null;
 
     // ── Image processing (save locally, give path to Pi) ────────────
+    // If visionAgent is enabled, also append an instruction for Pi to
+    // delegate analysis to the vision subagent (multimodal model like
+    // gpt-5.6-luna) so text-only parent models can still "see" images.
     if (qm.imageItem) {
       try {
         log(`[weixin] 处理图片...`);
@@ -1046,6 +1128,12 @@ async function runDaemon(): Promise<void> {
     // Append image path to message text if present
     if (imagePath) {
       messageText += `\n\n[用户发送了一张图片]\n🖼️ ${imagePath}`;
+      if (config.visionAgent) {
+        const subagent = config.visionSubagent ?? "vision";
+        messageText +=
+          `\n\n【系统指令】请使用 subagent 工具调用 "${subagent}" 子代理来分析这张图片` +
+          `（该子代理使用多模态模型描述图片内容），然后基于它的描述回复用户。`;
+      }
     }
 
     // ── File processing (store locally, give path to Pi) ──────────────
@@ -1121,10 +1209,24 @@ async function runDaemon(): Promise<void> {
       messageText = imagePath ? "[图片]" : filePath ? "[文件]" : voicePath ? "[语音]" : videoPath ? "[视频]" : "[空消息]";
     }
 
+    // ── Optional base64 attachment (attachImages=true, vision models) ──
+    let imageContents: ImageContent[] | null = null;
+    if (qm.imageItem && config.attachImages) {
+      try {
+        const img = await processImageForPi(qm.imageItem);
+        if (img) {
+          imageContents = [img];
+          log(`[weixin] 图片已转为 base64 附加到 prompt (${img.mimeType})`);
+        }
+      } catch (err) {
+        logWarn(`[weixin] 图片转 base64 失败，继续走路径方式: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     const summary = messageText.slice(0, 60) || "[空消息]";
     const fileInfo = qm.fileItem ? ` + 文件: ${qm.fileItem.file_name ?? "unknown"}` : "";
     log(`[weixin] 发送 prompt: ${summary}${messageText.length > 60 ? "..." : ""}${imagePath ? ` + 图片: ${imagePath}` : ""}${voicePath ? ` + 语音: ${voicePath}` : ""}${videoPath ? ` + 视频: ${videoPath}` : ""}${fileInfo}`);
-    rpcClient.sendPrompt(messageText);
+    rpcClient.sendPrompt(messageText, imageContents ?? undefined);
   }
 
   /**
@@ -1153,6 +1255,7 @@ async function runDaemon(): Promise<void> {
   function bindRpcEvents(client: RpcClient): void {
     client.on("agent_start", () => {
       log("[rpc] agent_start");
+      lastAgentError = null;
       sm.setAgentRunning();
     });
 
@@ -1169,25 +1272,46 @@ async function runDaemon(): Promise<void> {
         pendingContext = null;
 
         if (reply) {
-          await sendWeixinReply(
-            api,
-            ctx.account,
-            ctx.userId,
-            ctx.contextToken,
-            ctx.sessionId,
-            reply,
-          );
+          // ── Format + split long replies, apply status prefix ────────
+          const chunks = formatAndSplit(reply, config.maxReplyLength ?? 2000);
+          const prefix = config.replyPrefix ?? "";
+          for (const chunk of chunks) {
+            await sendWeixinReply(
+              api,
+              ctx.account,
+              ctx.userId,
+              ctx.contextToken,
+              ctx.sessionId,
+              `${prefix}${chunk}`,
+            );
+          }
         } else {
           log("[weixin] agent_end 中未找到 assistant 文本回复");
-          // Notify user that Pi produced no output (likely a model/API issue)
+          // Notify user with a classified error prompt when possible
+          const msg = lastAgentError
+            ? formatClassifiedError(lastAgentError)
+            : "⚠️ Pi 未生成回复。可能是当前模型不支持此输入（如图片），或处理异常。可发送 /model 切换模型。";
           await sendWeixinReply(
             api,
             ctx.account,
             ctx.userId,
             ctx.contextToken,
             ctx.sessionId,
-            "⚠️ Pi 未生成回复。可能是当前模型不支持此输入（如图片），或处理异常。可尝试切换模型。",
+            msg,
           ).catch(() => {});
+        }
+
+        // ── Persist the session file path (for resume after restart) ──
+        if (config.persistentSession && rpcClient) {
+          void rpcClient
+            .getState()
+            .then((state) => {
+              const sessionFile = (state as { sessionFile?: string } | null)?.sessionFile;
+              if (sessionFile) saveSavedSession(ctx.account.id, sessionFile);
+            })
+            .catch(() => {
+              /* best effort */
+            });
         }
 
         processingWeixin = false;
@@ -1309,12 +1433,15 @@ async function runDaemon(): Promise<void> {
 
     client.on("response", (event) => {
       if (!event.success) {
-        log(`[rpc] response error: ${event.command} → ${event.error ?? "unknown"}`);
+        const errText = event.error ?? "unknown";
+        lastAgentError = errText;
+        logWarn(`[rpc] response error: ${event.command} → ${errText} (${classifyError(errText).category})`);
       }
     });
 
     client.on("error", (err) => {
-      log(`[rpc] error: ${err.message}`);
+      lastAgentError = err.message;
+      logWarn(`[rpc] error: ${err.message} (${classifyError(err).category})`);
     });
 
     // ── Exit → Auto-Reconnect ──────────────────────────────────────────
@@ -1375,10 +1502,16 @@ async function runDaemon(): Promise<void> {
       await new Promise((r) => setTimeout(r, totalDelay));
 
       try {
-        const newClient = new RpcClient();
+        const newClient = new RpcClient(undefined, {
+          persistentSession: config.persistentSession ?? true,
+        });
         await newClient.spawn();
         rpcClient = newClient;
         bindRpcEvents(newClient);
+
+        // Re-apply default model + restore persisted session after reconnect
+        await applyDefaultModel(newClient);
+        await resumePersistedSession(newClient);
 
         log(
           `[rpc] 重连成功 (PID: ${(newClient as any).proc?.pid ?? "unknown"})`,
@@ -1418,10 +1551,16 @@ async function runDaemon(): Promise<void> {
   log("正在启动 Pi RPC 子进程...");
 
   try {
-    const initialClient = new RpcClient();
+    const initialClient = new RpcClient(undefined, {
+      persistentSession: config.persistentSession ?? true,
+    });
     await initialClient.spawn();
     rpcClient = initialClient;
     bindRpcEvents(initialClient);
+
+    // ── Apply default model + restore persisted session ─────────────
+    await applyDefaultModel(initialClient);
+    await resumePersistedSession(initialClient);
 
     log(
       `Pi RPC 子进程已启动 (PID: ${(initialClient as any).proc?.pid ?? "unknown"})`,
@@ -1493,7 +1632,7 @@ async function runDaemon(): Promise<void> {
     shutdown("SIGTERM").catch(() => {});
   });
 
-  log("pi-weixin-cli RPC 模式已启动，等待微信消息...");
+  log("pi-weixin-hub RPC 模式已启动，等待微信消息...");
 }
 
 // ── Entry ──────────────────────────────────────────────────────────────
