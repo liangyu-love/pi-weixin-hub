@@ -532,7 +532,11 @@ async function runDaemon(): Promise<void> {
           /* skip malformed */
         }
       }
-      fs.rmSync(QUEUE_FILE, { force: true });
+      // NOTE: do NOT delete the file here — the on-disk copy remains the
+      // recovery source until the next enqueue/dequeue rewrites it. If the
+      // daemon dies before processing, the items are recovered again
+      // (at-least-once delivery). persistQueueNow() on the next mutation
+      // replaces the file with the correct in-memory state.
       if (loaded > 0) {
         log(`[queue] 已从磁盘恢复 ${loaded} 条未处理消息`);
       }
@@ -552,6 +556,10 @@ async function runDaemon(): Promise<void> {
   let turnData: { messages: unknown[] | undefined; aborted: boolean } | null = null;
   /** Backstop timer if agent_settled never arrives after a retrying run. */
   let turnWatchdog: ReturnType<typeof setTimeout> | null = null;
+  /** Set when the user issues /abort; forces the next finalize to be treated as aborted. */
+  let pendingAbort = false;
+  /** Fallback timer to force a clean turn reset if pi emits no agent_end after /abort. */
+  let turnAbortTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Most recent routing context per account (for webhook default target). */
   const lastSenders = new Map<string, PendingContext>();
@@ -802,8 +810,19 @@ async function runDaemon(): Promise<void> {
         }
 
         case "abort": {
+          pendingAbort = true;
           rpcClient.sendAbort();
           await sendWeixinReply(api, account, userId, contextToken, sessionId, "✅ 已中止当前任务");
+          // Fallback: pi may not emit agent_end after an abort in some
+          // states — force a clean turn reset if nothing arrives.
+          if (turnAbortTimer) clearTimeout(turnAbortTimer);
+          turnAbortTimer = setTimeout(() => {
+            turnAbortTimer = null;
+            if (!turnData && processingWeixin) {
+              turnData = { messages: [], aborted: true };
+            }
+            if (turnData) void finalizeTurn();
+          }, 15_000);
           log(`[slash] /abort (user=${userId})`);
           break;
         }
@@ -1609,6 +1628,7 @@ async function runDaemon(): Promise<void> {
       }).catch((err) => log(`[weixin] 注入失败: ${err instanceof Error ? err.message : String(err)}`));
     } else {
       // Pi is busy or already processing — queue
+      const wasQueueEmpty = messageQueue.length === 0;
       log(`[weixin] Pi 忙碌，消息入队 (队列长度: ${messageQueue.length + 1})`);
       enqueueMessage({
         account,
@@ -1622,6 +1642,12 @@ async function runDaemon(): Promise<void> {
         voiceItem,
         videoItem,
       });
+      // Let the user know their message is queued (first one per busy period)
+      if (wasQueueEmpty) {
+        sendWeixinReply(api, account, userId, latestToken, sessionId,
+          "⏳ 前一条消息还在处理中，你的消息已排队，完成后会回复。",
+        ).catch(() => {});
+      }
     }
   };
 
@@ -2054,11 +2080,17 @@ async function runDaemon(): Promise<void> {
    */
   async function finalizeTurn(): Promise<void> {
     if (!turnData) return;
-    const { messages, aborted } = turnData;
+    const aborted = pendingAbort || turnData.aborted;
+    pendingAbort = false;
+    const { messages } = turnData;
     turnData = null;
     if (turnWatchdog) {
       clearTimeout(turnWatchdog);
       turnWatchdog = null;
+    }
+    if (turnAbortTimer) {
+      clearTimeout(turnAbortTimer);
+      turnAbortTimer = null;
     }
 
     const reply = extractAssistantReply(messages);
@@ -2137,6 +2169,7 @@ async function runDaemon(): Promise<void> {
     client.on("agent_start", () => {
       log("[rpc] agent_start");
       lastAgentError = null;
+      pendingAbort = false; // a new turn means the previous abort is moot
       sm.setAgentRunning();
       // Show the typing indicator while Pi works
       if (pendingContext) {
@@ -2577,6 +2610,14 @@ async function runDaemon(): Promise<void> {
   // ── Start status heartbeat ──────────────────────────────────────────
   writeStatusHeartbeat();
   setInterval(writeStatusHeartbeat, 5_000).unref();
+
+  // ── Process any messages recovered from a previous run ──────────────
+  // flushQueue normally only fires on agent_end; at startup nothing
+  // triggers it, so recovered queue items would sit forever.
+  if (messageQueue.length > 0) {
+    log(`[queue] 开始处理 ${messageQueue.length} 条恢复的消息`);
+    setImmediate(() => flushQueue());
+  }
 
   log("pi-weixin-hub RPC 模式已启动，等待微信消息...");
 }
