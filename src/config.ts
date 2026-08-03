@@ -45,6 +45,8 @@ export interface WeixinConfig {
   costAlert?: number;
   /** 每用户模型映射：{ userId: "provider/modelId" }。 */
   userModels?: Record<string, string>;
+  /** 讨论优先：默认禁止自主执行工具/改文件，需用户明确同意。 */
+  requireApproval?: boolean;
   /** 本地 webhook 端口（0 = 禁用）；供 Pi 扩展/脚本主动推送消息。 */
   webhookPort?: number;
   /** webhook 访问令牌（空则 daemon 启动时自动生成）。 */
@@ -91,6 +93,7 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   queueTtlMin: 30,
   costAlert: 0,
   userModels: {},
+  requireApproval: true,
   webhookPort: 0,
   webhookToken: "",
   groupChat: false,
@@ -229,6 +232,11 @@ export function setConfigValue(
       }
     }
 
+    case "requireApproval": {
+      config.requireApproval = rawValue === "true" || rawValue === "1" || rawValue === "yes";
+      return null;
+    }
+
     case "autoCompactThreshold": {
       const n = parseInt(rawValue, 10);
       if (isNaN(n) || n < 0 || n > 100) return `autoCompactThreshold 必须是 0-100 的数字（0=禁用）`;
@@ -342,6 +350,7 @@ export function describeConfig(config: WeixinConfig): string {
       ? Object.entries(config.userModels).map(([u, m]) => `${u}=${m}`).join(", ")
       : "(无)",
   );
+  label("requireApproval", config.requireApproval !== false ? "启用（讨论优先，执行需同意）" : "禁用（自主执行）");
   label("webhookPort", config.webhookPort && config.webhookPort > 0 ? `127.0.0.1:${config.webhookPort}` : "(禁用)");
   label("webhookToken", config.webhookToken ? `${config.webhookToken.slice(0, 6)}...` : "(自动生成)");
   label("groupChat", config.groupChat ? "启用" : "禁用（忽略群消息）");
@@ -355,9 +364,6 @@ export function describeConfig(config: WeixinConfig): string {
   label("visionSubagent", config.visionSubagent ?? "vision");
   label("attachImages", config.attachImages ? "启用" : "禁用（走 vision 子代理）");
   label("autoConvertDocuments", config.autoConvertDocuments !== false ? "启用（MarkItDown）" : "禁用");
-  label("documentMaxChars", `${config.documentMaxChars ?? 8000} 字符`);
-  label("documentMaxMb", `${config.documentMaxMb ?? 20}MB`);
-  label("autoConvertDocuments", config.autoConvertDocuments ? "启用" : "禁用");
   label("documentMaxChars", config.documentMaxChars ? `${config.documentMaxChars} 字符` : "(0=不限)");
   label("documentMaxMb", `${config.documentMaxMb ?? 20} MB`);
   return lines.join("\n");

@@ -2059,11 +2059,25 @@ async function runDaemon(): Promise<void> {
     }
   }
 
-  // ── Persona / memory injection (C2) ──────────────────────────────────
+  // ── Persona / memory / execution-rule injection (C2 + habit) ─────────
 
-  /** Build the system-context prefix (persona + memory file) for a prompt. */
+  /**
+   * Build the system-context prefix for prompts:
+   * persona + long-term memory + the discussion-first execution rule.
+   */
   function buildContextPrefixForConfig(): string {
-    return buildContextPrefix(config.persona);
+    const parts: string[] = [];
+    const base = buildContextPrefix(config.persona);
+    if (base) parts.push(base);
+    if (config.requireApproval !== false) {
+      parts.push(
+        "【执行规则】除非用户明确要求执行（如说“请执行/请修改/请运行/帮我做/直接改”），" +
+        "否则只进行讨论和回答，不要调用工具、运行命令或修改任何文件。" +
+        "如果用户的需求需要执行操作，先给出简短计划并询问“是否执行？”，" +
+        "得到用户明确同意后再行动。",
+      );
+    }
+    return parts.length > 0 ? parts.join("\n\n") + "\n\n---\n\n" : "";
   }
 
   // ── Auto-compact + usage tracking (C3/E1) ────────────────────────────

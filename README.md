@@ -328,6 +328,7 @@ pi-weixin-cli 支持接收微信视频消息：
 | `queueTtlMin` | number | `30` | 崩溃恢复时队列消息有效期（分钟，`0` = 不过期） |
 | `costAlert` | number | `0` | 月度费用预算（USD，超限时微信提醒，`0` = 禁用） |
 | `userModels` | object | `{}` | 每用户模型映射 `{ "userId": "provider/modelId" }` |
+| `requireApproval` | boolean | `true` | 讨论优先：默认禁止自主执行工具/改文件，执行需用户明确同意 |
 | `groupChat` | boolean | `false` | 是否响应群聊消息 |
 | `botName` | string | `""` | 群聊触发昵称（消息需含 `@botName`；空 = 处理所有群消息） |
 | `maxReplyLength` | number | `2000` | 单条回复最大字符数，超过自动拆分（`0` = 不拆分） |
@@ -410,6 +411,12 @@ cp extension/pi-weixin-hub.ts ~/.pi/agent/extensions/
 - **人设**：`config set persona "你是我的微信私人助理"`，每条 prompt 自动注入
 - **长期记忆**：编辑 `~/.config/pi-weixin-cli/memory.md`（或直接告诉 Pi 更新它），内容会随每条 prompt 注入；`/memory` 命令可查看
 - **自动压缩**：上下文使用率 ≥ `autoCompactThreshold`（默认 80%）时，下一条消息前自动 `/compact`，避免长对话触发上下文溢出
+
+## 执行规则（讨论优先）
+
+`requireApproval`（默认开启）会在每条 prompt 中注入执行规则：**除非你明确要求执行**
+（如说“请执行/请修改/请运行/帮我做”），否则只讨论不执行；需要执行时先给出计划并询问，
+得到你同意后再行动。想恢复自主执行可 `config set requireApproval false`。
 
 ## 成本与模型控制（Phase E）
 
