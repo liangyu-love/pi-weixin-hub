@@ -6,6 +6,7 @@ import process from "node:process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import { startQRLogin } from "./auth.js";
 import { WeixinApi } from "./api.js";
@@ -177,10 +178,21 @@ function handleStopDaemon(): number {
       return 1;
     }
     try {
-      process.kill(pid, "SIGTERM");
+      if (process.platform === "win32") {
+        // Kill the whole tree (daemon + its pi child) so no orphan remains
+        execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+          stdio: "ignore",
+        });
+      } else {
+        process.kill(pid, "SIGTERM");
+      }
     } catch {
       process.stdout.write(`PID ${pid} 已不存在（daemon 可能已停止）。\n`);
-      fs.unlinkSync(pidFile);
+      try {
+        fs.unlinkSync(pidFile);
+      } catch {
+        /* ignore */
+      }
       return 0;
     }
     process.stdout.write(`已发送停止信号到 daemon (PID ${pid})。\n`);

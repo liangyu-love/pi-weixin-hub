@@ -223,6 +223,7 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
       }
       const child = spawn(this.spawnTarget.command, args, {
         stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true, // hide the console window on Windows
         env: { ...process.env },
       });
 
