@@ -191,10 +191,14 @@ interface BashCommand {
 
 async function runDaemon(): Promise<void> {
   log("pi-weixin-hub RPC 模式启动中...");
-  const daemonCwd = process.cwd();
 
   // ── Load config ──────────────────────────────────────────────────────
   const config = loadConfig();
+  // Pi session working directory: config.workDir overrides the daemon cwd
+  const daemonCwd = config.workDir?.trim() || process.cwd();
+  if (config.workDir) {
+    log(`[workdir] Pi 工作目录: ${daemonCwd}`);
+  }
   // When forked into the background, default to a log file if none is set
   if (!config.logFile && process.env.PI_FORKED === "1") {
     config.logFile = path.join(os.homedir(), ".config", "pi-weixin-cli", "daemon.log");
@@ -1371,10 +1375,10 @@ async function runDaemon(): Promise<void> {
 
   /** Buffer a notification; consecutive ones are merged after 1.5s. */
   function bufferUiNotification(ctx: PendingContext, text: string): void {
-    // Dedup: identical notification text within 30s is progress spam from
-    // a long agentic turn — forward it only once.
+    // Dedup: identical notification text within 5 minutes is periodic
+    // progress spam — forward it only once.
     const now = Date.now();
-    if (text === lastNotifyText && now - lastNotifyAt < 30_000) {
+    if (text === lastNotifyText && now - lastNotifyAt < 5 * 60_000) {
       logDebug(`[rpc] 忽略重复通知: ${text.slice(0, 60)}`);
       return;
     }
@@ -2320,9 +2324,17 @@ async function runDaemon(): Promise<void> {
       // ── Fire-and-forget: merge into a debounced notification buffer ──
       if (isFireAndForget(method)) {
         if (pendingContext) {
-          const formatted = formatUIRequestForWeixin(event);
-          if (formatted) {
-            bufferUiNotification(pendingContext, formatted);
+          // Respect the notify-forwarding policy: default forwards only
+          // errors/warnings so periodic progress notifies don't flood WeChat.
+          const policy = config.forwardNotifies ?? "errors";
+          if (policy !== "none") {
+            const isImportant = event.notifyType === "error" || event.notifyType === "warning";
+            if (policy === "all" || isImportant) {
+              const formatted = formatUIRequestForWeixin(event);
+              if (formatted) {
+                bufferUiNotification(pendingContext, formatted);
+              }
+            }
           }
         } else {
           log(`[rpc] 忽略 ${method} (无活跃微信会话)`);
@@ -2491,6 +2503,7 @@ async function runDaemon(): Promise<void> {
       try {
         const newClient = new RpcClient(undefined, {
           persistentSession: config.persistentSession ?? true,
+          cwd: daemonCwd,
         });
         await newClient.spawn();
         rpcClient = newClient;
@@ -2540,6 +2553,7 @@ async function runDaemon(): Promise<void> {
   try {
     const initialClient = new RpcClient(undefined, {
       persistentSession: config.persistentSession ?? true,
+      cwd: daemonCwd,
     });
     await initialClient.spawn();
     rpcClient = initialClient;

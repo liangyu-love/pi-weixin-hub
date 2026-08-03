@@ -140,6 +140,8 @@ export interface RpcSpawnOptions {
    * false → pass `--no-session` (ephemeral, context is discarded on exit).
    */
   persistentSession?: boolean;
+  /** Working directory for the Pi RPC subprocess (session project dir). */
+  cwd?: string;
 }
 
 // ── Event payload types for strongly-typed listeners ──────────────────
@@ -171,6 +173,7 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
   private readonly piPath: string;
   private readonly persistentSession: boolean;
   private readonly spawnTarget: ResolvedTarget;
+  private readonly spawnCwd: string | undefined;
 
   /** Pending requests awaiting a response event, keyed by request id. */
   private pendingRequests = new Map<
@@ -184,6 +187,7 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
     this.spawnTarget = resolvePiTarget(piPath);
     this.piPath = this.spawnTarget.command;
     this.persistentSession = opts.persistentSession ?? true;
+    this.spawnCwd = opts.cwd;
   }
 
   // ── Public accessors ─────────────────────────────────────────────────
@@ -224,6 +228,7 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
       const child = spawn(this.spawnTarget.command, args, {
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true, // hide the console window on Windows
+        cwd: this.spawnCwd,
         env: { ...process.env },
       });
 

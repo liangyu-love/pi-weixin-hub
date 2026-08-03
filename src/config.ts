@@ -52,6 +52,10 @@ export interface WeixinConfig {
    * 消息以 "push:" 开头则直接推送文本；否则作为 prompt 注入 pi 后回复。
    */
   schedules?: Record<string, string>;
+  /** Pi 会话的工作目录（daemon 启动时 cwd 的替代）。空 = 使用 daemon 启动目录。 */
+  workDir?: string;
+  /** 通知转发策略：all=全部 / errors=仅错误与警告 / none=不转发。默认 errors。 */
+  forwardNotifies?: "all" | "errors" | "none";
   /** 本地 webhook 端口（0 = 禁用）；供 Pi 扩展/脚本主动推送消息。 */
   webhookPort?: number;
   /** webhook 访问令牌（空则 daemon 启动时自动生成）。 */
@@ -100,6 +104,8 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   userModels: {},
   requireApproval: true,
   schedules: {},
+  workDir: "",
+  forwardNotifies: "errors",
   webhookPort: 0,
   webhookToken: "",
   groupChat: false,
@@ -261,6 +267,24 @@ export function setConfigValue(
       }
     }
 
+    case "workDir": {
+      const dir = rawValue.trim();
+      if (dir && !fs.existsSync(dir)) {
+        return `目录不存在: ${dir}`;
+      }
+      config.workDir = dir || undefined;
+      return null;
+    }
+
+    case "forwardNotifies": {
+      const v = rawValue.toLowerCase();
+      if (!["all", "errors", "none"].includes(v)) {
+        return `forwardNotifies 必须是 all / errors / none 之一`;
+      }
+      config.forwardNotifies = v as WeixinConfig["forwardNotifies"];
+      return null;
+    }
+
     case "autoCompactThreshold": {
       const n = parseInt(rawValue, 10);
       if (isNaN(n) || n < 0 || n > 100) return `autoCompactThreshold 必须是 0-100 的数字（0=禁用）`;
@@ -380,6 +404,11 @@ export function describeConfig(config: WeixinConfig): string {
     config.schedules && Object.keys(config.schedules).length > 0
       ? Object.entries(config.schedules).map(([k, v]) => `${k}=${v.slice(0, 24)}`).join(" · ")
       : "(无)",
+  );
+  label("workDir", config.workDir ?? "(daemon 启动目录)");
+  label(
+    "forwardNotifies",
+    config.forwardNotifies === "all" ? "全部转发" : config.forwardNotifies === "none" ? "不转发" : "仅错误/警告",
   );
   label("webhookPort", config.webhookPort && config.webhookPort > 0 ? `127.0.0.1:${config.webhookPort}` : "(禁用)");
   label("webhookToken", config.webhookToken ? `${config.webhookToken.slice(0, 6)}...` : "(自动生成)");
