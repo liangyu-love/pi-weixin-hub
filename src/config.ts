@@ -35,11 +35,11 @@ export interface WeixinConfig {
   logLevel?: "debug" | "info" | "warn" | "error";
   /** 持久会话：重启后自动恢复上次的 session 上下文。 */
   persistentSession?: boolean;
-  /** 图片分析：收到图片时指示 Pi 使用 vision 子代理。 */
+  /** 图片分析：自动检测模型视觉能力（视觉模型直接附加，文本模型走 vision 子代理）。 */
   visionAgent?: boolean;
   /** vision 子代理名称。默认 "vision"。 */
   visionSubagent?: string;
-  /** 将图片以 base64 直接附加到 prompt。默认 false（走 vision 子代理文件读取）。 */
+  /** 强制将图片以 base64 直接附加到 prompt（覆盖自动检测）。默认 false。 */
   attachImages?: boolean;
 }
 

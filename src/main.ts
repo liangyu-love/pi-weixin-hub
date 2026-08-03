@@ -32,7 +32,7 @@ import os from "node:os";
 
 import { WeixinApi } from "./api.js";
 import { Poller, type MessageCallback, type LogCallback } from "./poller.js";
-import { RpcClient } from "./rpc-client.js";
+import { RpcClient, setRpcLogLevel } from "./rpc-client.js";
 import { loadAccounts, saveContextToken, loadContextTokens, loadSavedSession, saveSavedSession } from "./storage.js";
 import { loadConfig } from "./config.js";
 import { Logger, resolveLogLevel } from "./logger.js";
@@ -41,7 +41,7 @@ import { classifyError, formatClassifiedError } from "./error-classifier.js";
 import type { WeixinAccount, ImageItem, FileItem, VoiceItem, VideoItem } from "./types.js";
 import { MessageItemType, MessageType, MessageState } from "./types.js";
 import type { AgentEndEvent, ExtensionUIRequestEvent, ImageContent } from "./types-rpc.js";
-import { processImageForPi, saveImageLocally, saveFileLocally, saveVoiceLocally, saveVideoLocally } from "./media-handler.js";
+import { downloadImageForWeixin, saveFileLocally, saveVoiceLocally, saveVideoLocally, setMediaLogLevel } from "./media-handler.js";
 import { StateMachine, type UIMethod, type UIRequestContext } from "./state-machine.js";
 import { formatUIRequestForWeixin, isFireAndForget, parseUserResponse } from "./ui-bridge.js";
 import { runCLI } from "./cli.js";
@@ -184,65 +184,10 @@ async function runDaemon(): Promise<void> {
 
   // ── Load config ──────────────────────────────────────────────────────
   const config = loadConfig();
-  logger.setLevel(resolveLogLevel(config.logLevel));
-
-  // ── Default model + persistent session helpers ───────────────────────
-
-  /**
-   * Apply config.defaultModel to the given RPC client (best effort).
-   * Accepts "provider/modelId" or a bare model id/name.
-   */
-  async function applyDefaultModel(client: RpcClient): Promise<void> {
-    const model = config.defaultModel;
-    if (!model) return;
-    try {
-      if (model.includes("/")) {
-        const [provider, modelId] = model.split("/", 2);
-        await client.setModel(provider, modelId);
-        log(`[rpc] 默认模型已应用: ${model}`);
-      } else {
-        const result = (await client.getAvailableModels()) as {
-          models?: Array<Record<string, unknown>>;
-        } | null;
-        const models = result?.models ?? [];
-        const found = models.find(
-          (m) => (m.id ?? m.modelId ?? m.name) === model,
-        ) as Record<string, unknown> | undefined;
-        if (found) {
-          await client.setModel(
-            (found.provider as string) ?? "",
-            (found.id ?? found.modelId) as string,
-          );
-          log(`[rpc] 默认模型已应用: ${(found.name ?? found.id) as string}`);
-        } else {
-          logWarn(`[rpc] 默认模型 ${model} 不在可用模型列表中，跳过`);
-        }
-      }
-    } catch (err) {
-      logWarn(`[rpc] 应用默认模型失败: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  /**
-   * Resume the last-known Pi session file for an account (best effort).
-   * Only the first account with an existing session file is restored,
-   * since the daemon shares a single RPC process.
-   */
-  async function resumePersistedSession(client: RpcClient): Promise<void> {
-    if (!config.persistentSession) return;
-    for (const account of accounts) {
-      const saved = loadSavedSession(account.id);
-      if (saved && fs.existsSync(saved)) {
-        try {
-          await client.switchSession(saved);
-          log(`[rpc] 已恢复 ${account.id} 的持久会话: ${saved}`);
-        } catch (err) {
-          logWarn(`[rpc] 恢复会话失败 (${account.id}): ${err instanceof Error ? err.message : String(err)}`);
-        }
-        break;
-      }
-    }
-  }
+  const effectiveLogLevel = resolveLogLevel(config.logLevel);
+  logger.setLevel(effectiveLogLevel);
+  setMediaLogLevel(effectiveLogLevel);
+  setRpcLogLevel(effectiveLogLevel);
 
   // ── Respect config.enabled ───────────────────────────────────────────
   if (!config.enabled) {
@@ -261,6 +206,105 @@ async function runDaemon(): Promise<void> {
   }
 
   log(`已加载 ${accounts.length} 个微信账号: ${accounts.map((a) => a.id).join(", ")}`);
+
+  // ── Default model + persistent session helpers ───────────────────────
+
+  /**
+   * Apply config.defaultModel to the given RPC client (best effort).
+   * Accepts "provider/modelId" or a bare model id/name.
+   */
+  async function applyDefaultModel(client: RpcClient): Promise<void> {
+    const model = config.defaultModel;
+    if (!model) return;
+    try {
+      if (model.includes("/")) {
+        const [provider, modelId] = model.split("/", 2);
+        await client.setModel(provider, modelId);
+        invalidateVisionCache();
+        log(`[rpc] 默认模型已应用: ${model}`);
+      } else {
+        const result = (await client.getAvailableModels()) as {
+          models?: Array<Record<string, unknown>>;
+        } | null;
+        const models = result?.models ?? [];
+        const found = models.find(
+          (m) => (m.id ?? m.modelId ?? m.name) === model,
+        ) as Record<string, unknown> | undefined;
+        if (found) {
+          await client.setModel(
+            (found.provider as string) ?? "",
+            (found.id ?? found.modelId) as string,
+          );
+          invalidateVisionCache();
+          log(`[rpc] 默认模型已应用: ${(found.name ?? found.id) as string}`);
+        } else {
+          logWarn(`[rpc] 默认模型 ${model} 不在可用模型列表中，跳过`);
+        }
+      }
+    } catch (err) {
+      logWarn(`[rpc] 应用默认模型失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Resume the most recently modified Pi session file across accounts
+   * (the daemon shares a single RPC process, so only one is restored).
+   */
+  async function resumePersistedSession(client: RpcClient): Promise<void> {
+    if (!config.persistentSession) return;
+    let best: { accountId: string; path: string; mtime: number } | null = null;
+    for (const account of accounts) {
+      const saved = loadSavedSession(account.id);
+      if (!saved || !fs.existsSync(saved)) continue;
+      try {
+        const mtime = fs.statSync(saved).mtimeMs;
+        if (!best || mtime > best.mtime) {
+          best = { accountId: account.id, path: saved, mtime };
+        }
+      } catch {
+        /* unreadable file — skip */
+      }
+    }
+    if (best) {
+      try {
+        await client.switchSession(best.path);
+        log(`[rpc] 已恢复 ${best.accountId} 的持久会话: ${best.path}`);
+      } catch (err) {
+        logWarn(`[rpc] 恢复会话失败 (${best.accountId}): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  // ── Vision capability detection (adaptive image handling) ────────────
+
+  /** Cache of the active model's vision capability: key → hasVision. */
+  let visionCache: { key: string; hasVision: boolean } | null = null;
+
+  /** Invalidate the vision cache (call after any model switch). */
+  function invalidateVisionCache(): void {
+    visionCache = null;
+  }
+
+  /**
+   * Whether the currently active Pi model supports image input.
+   * Cached per model; falls back to false (subagent path) on failure.
+   */
+  async function getModelHasVision(client: RpcClient): Promise<boolean> {
+    try {
+      const state = (await client.getState()) as {
+        model?: { provider?: string; id?: string; input?: string[] } | null;
+      } | null;
+      const model = state?.model;
+      const key = model ? `${model.provider ?? ""}/${model.id ?? ""}` : "";
+      if (!key) return visionCache?.hasVision ?? false;
+      if (visionCache && visionCache.key === key) return visionCache.hasVision;
+      const hasVision = Array.isArray(model?.input) && model.input.includes("image");
+      visionCache = { key, hasVision };
+      return hasVision;
+    } catch {
+      return visionCache?.hasVision ?? false;
+    }
+  }
 
   // ── Initialize API client ────────────────────────────────────────────
   const api = new WeixinApi();
@@ -592,6 +636,7 @@ async function runDaemon(): Promise<void> {
 
         case "cycle-model": {
           const result = (await rpcClient.cycleModel()) as { model?: { name?: string; id?: string } } | null;
+          invalidateVisionCache();
           const modelName = result?.model?.name ?? result?.model?.id ?? "未知模型";
           await sendWeixinReply(api, account, userId, contextToken, sessionId,
             `✅ 已切换模型: ${modelName}`);
@@ -900,6 +945,7 @@ async function runDaemon(): Promise<void> {
         void (async () => {
           try {
             await rpcClient!.setModel(provider, modelId);
+            invalidateVisionCache();
             const name = (model.name ?? modelId) as string;
             await sendWeixinReply(
               api,
@@ -1089,18 +1135,17 @@ async function runDaemon(): Promise<void> {
 
     let messageText = qm.text;
     let imagePath: string | null = null;
+    let imageContent: ImageContent | null = null;
 
-    // ── Image processing (save locally, give path to Pi) ────────────
-    // If visionAgent is enabled, also append an instruction for Pi to
-    // delegate analysis to the vision subagent (multimodal model like
-    // gpt-5.6-luna) so text-only parent models can still "see" images.
+    // ── Image processing (single download: save locally + base64) ──────
     if (qm.imageItem) {
       try {
         log(`[weixin] 处理图片...`);
-        const savedPath = await saveImageLocally(qm.imageItem);
-        if (savedPath) {
-          imagePath = savedPath;
-          log(`[weixin] 图片已保存: ${savedPath}`);
+        const media = await downloadImageForWeixin(qm.imageItem);
+        if (media) {
+          imagePath = media.path;
+          imageContent = media.content;
+          log(`[weixin] 图片已保存: ${media.path}`);
         } else {
           log(`[weixin] 图片处理失败：无法获取图片 URL`);
           await sendWeixinReply(
@@ -1125,14 +1170,25 @@ async function runDaemon(): Promise<void> {
       }
     }
 
-    // Append image path to message text if present
+    // ── Append image path; decide attach-vs-subagent by model capability ──
+    //   * attachImages=true       → always attach base64 (user override)
+    //   * visionAgent + vision    → attach base64 directly (primary model sees)
+    //   * visionAgent + no vision → instruct Pi to delegate to the vision subagent
+    let attachImage = false;
     if (imagePath) {
       messageText += `\n\n[用户发送了一张图片]\n🖼️ ${imagePath}`;
-      if (config.visionAgent) {
-        const subagent = config.visionSubagent ?? "vision";
-        messageText +=
-          `\n\n【系统指令】请使用 subagent 工具调用 "${subagent}" 子代理来分析这张图片` +
-          `（该子代理使用多模态模型描述图片内容），然后基于它的描述回复用户。`;
+      if (config.attachImages) {
+        attachImage = true;
+      } else if (config.visionAgent && rpcClient) {
+        const modelVision = await getModelHasVision(rpcClient);
+        if (modelVision) {
+          attachImage = true;
+        } else {
+          const subagent = config.visionSubagent ?? "vision";
+          messageText +=
+            `\n\n【系统指令】当前模型不支持图片输入。请使用 subagent 工具调用 "${subagent}"` +
+            ` 子代理来分析这张图片（该子代理使用多模态模型描述图片内容），然后基于它的描述回复用户。`;
+        }
       }
     }
 
@@ -1209,18 +1265,11 @@ async function runDaemon(): Promise<void> {
       messageText = imagePath ? "[图片]" : filePath ? "[文件]" : voicePath ? "[语音]" : videoPath ? "[视频]" : "[空消息]";
     }
 
-    // ── Optional base64 attachment (attachImages=true, vision models) ──
+    // ── Attach base64 image when the active model supports vision ──
     let imageContents: ImageContent[] | null = null;
-    if (qm.imageItem && config.attachImages) {
-      try {
-        const img = await processImageForPi(qm.imageItem);
-        if (img) {
-          imageContents = [img];
-          log(`[weixin] 图片已转为 base64 附加到 prompt (${img.mimeType})`);
-        }
-      } catch (err) {
-        logWarn(`[weixin] 图片转 base64 失败，继续走路径方式: ${err instanceof Error ? err.message : String(err)}`);
-      }
+    if (attachImage && imageContent) {
+      imageContents = [imageContent];
+      log(`[weixin] 图片已附加到 prompt (${imageContent.mimeType})`);
     }
 
     const summary = messageText.slice(0, 60) || "[空消息]";
@@ -1271,7 +1320,13 @@ async function runDaemon(): Promise<void> {
         const ctx = pendingContext;
         pendingContext = null;
 
-        if (reply) {
+        if (aborted) {
+          // Intentional abort (user /abort or Pi aborted) — no error prompt
+          await sendWeixinReply(
+            api, ctx.account, ctx.userId, ctx.contextToken, ctx.sessionId,
+            "⏹️ 已中止当前任务",
+          ).catch(() => {});
+        } else if (reply) {
           // ── Format + split long replies, apply status prefix ────────
           const chunks = formatAndSplit(reply, config.maxReplyLength ?? 2000);
           const prefix = config.replyPrefix ?? "";

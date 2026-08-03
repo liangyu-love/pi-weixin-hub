@@ -128,9 +128,28 @@ export function splitReply(text: string, maxLength: number): string[] {
 
     let splitAt = newlineIdx;
     if (splitAt <= 0) {
-      // No newline in range — hard wrap at a space, else at maxLength.
+      // No newline in range — prefer the last space before the limit.
       const spaceIdx = slice.lastIndexOf(" ");
-      splitAt = spaceIdx > maxLength * 0.5 ? spaceIdx : maxLength;
+      splitAt = spaceIdx > maxLength * 0.5 ? spaceIdx : -1;
+    }
+
+    if (splitAt <= 0) {
+      // Hard wrap: prefer the next space within a bounded lookahead so
+      // long URLs / words aren't split mid-token. Bounded at +30% length.
+      const lookaheadLen = Math.min(
+        Math.floor(maxLength * 0.3) + 1,
+        remaining.length - maxLength,
+      );
+      const nextSpace = remaining
+        .slice(maxLength, maxLength + lookaheadLen)
+        .indexOf(" ");
+      splitAt = nextSpace !== -1 ? maxLength + nextSpace : maxLength;
+
+      // Never split a UTF-16 surrogate pair (emoji / astral chars).
+      if (splitAt > 0 && splitAt < remaining.length) {
+        const code = remaining.charCodeAt(splitAt);
+        if (code >= 0xdc00 && code <= 0xdfff) splitAt -= 1;
+      }
     }
     if (splitAt <= 0) splitAt = maxLength;
 

@@ -46,9 +46,9 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   replyPrefix        AI 回复前缀 (如 "🤖 ")
   logLevel           日志级别 (debug/info/warn/error)
   persistentSession  重启后恢复上下文 (true/false)
-  visionAgent        图片分析走 vision 子代理 (true/false)
+  visionAgent        图片分析（自动检测模型能力，默认开启） (true/false)
   visionSubagent     vision 子代理名称 (默认 vision)
-  attachImages       图片以 base64 直接附加 (true/false)
+  attachImages       强制 base64 直接附加图片（覆盖自动检测） (true/false)
 `;
 
 function printHelp(): void {

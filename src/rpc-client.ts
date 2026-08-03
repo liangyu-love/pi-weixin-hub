@@ -15,6 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { EventEmitter } from "node:events";
+import { Logger, type LogLevel } from "./logger.js";
 import type {
   RpcStdinCommand,
   RpcStdoutEvent,
@@ -31,6 +32,15 @@ import type {
 // ── Constants ──────────────────────────────────────────────────────────
 
 const DEFAULT_PI_PATH = "/home/qq110/.npm-global/bin/pi";
+
+// ── Module logger (level synced from the daemon config) ─────────────────
+
+const rpcLogger = new Logger("info", "rpc");
+
+/** Sync the RPC module's log level from the daemon config. */
+export function setRpcLogLevel(level: LogLevel): void {
+  rpcLogger.setLevel(level);
+}
 
 // ── Pi executable resolution ────────────────────────────────────────────
 
@@ -75,6 +85,11 @@ function findPiOnPath(): string | null {
 function resolvePiTarget(piPath?: string): ResolvedTarget {
   const explicit = piPath ?? process.env.PI_PATH;
   if (explicit) {
+    // If PI_PATH points directly at the CLI JS entry, run it via node
+    // (a .js file is not directly executable on Windows).
+    if (/cli\.js$/i.test(explicit)) {
+      return { command: process.execPath, args: [explicit] };
+    }
     return { command: explicit, args: [] };
   }
 
@@ -331,8 +346,7 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
       const imgInfo = images && images.length > 0
         ? images.map((img) => `${img.mimeType ?? "?"}(${(img.data ?? "").length}chars)`).join(", ")
         : "none";
-      // eslint-disable-next-line no-console
-      console.error(`[rpc→pi] ${cmdType} | msg="${msg?.slice(0, 200) ?? ""}${(msg?.length ?? 0) > 200 ? "..." : ""}" | images=${imgInfo}`);
+      rpcLogger.debug(`[rpc→pi] ${cmdType} | msg="${msg?.slice(0, 200) ?? ""}${(msg?.length ?? 0) > 200 ? "..." : ""}" | images=${imgInfo}`);
     }
 
     this.proc.stdin.write(line);

@@ -10,6 +10,16 @@ import path from "node:path";
 import type { WeixinMessage, ImageItem, FileItem, VoiceItem, VideoItem } from "./types.js";
 import { MessageItemType } from "./types.js";
 import type { ImageContent } from "./types-rpc.js";
+import { Logger, type LogLevel } from "./logger.js";
+
+// ── Module logger (level synced from the daemon config) ─────────────────
+
+const logger = new Logger("info", "media");
+
+/** Sync the media module's log level from the daemon config. */
+export function setMediaLogLevel(level: LogLevel): void {
+  logger.setLevel(level);
+}
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -151,12 +161,12 @@ export async function decryptIfNeeded(
       // raw hex string (32 chars)
       keyBytes = Buffer.from(aesKey, "hex");
     } else {
-      console.error(`[media] decrypt: cannot parse aes_key (decoded len=${decoded.length})`);
+      logger.warn(`decrypt: cannot parse aes_key (decoded len=${decoded.length})`);
       return buffer;
     }
 
     if (keyBytes.length !== 16) {
-      console.error(`[media] decrypt: key must be 16 bytes, got ${keyBytes.length}`);
+      logger.warn(`decrypt: key must be 16 bytes, got ${keyBytes.length}`);
       return buffer;
     }
 
@@ -169,7 +179,7 @@ export async function decryptIfNeeded(
 
     return decrypted;
   } catch (err) {
-    console.error(`[media] decrypt failed: ${err instanceof Error ? err.message : String(err)}`);
+    logger.warn(`decrypt failed: ${err instanceof Error ? err.message : String(err)}`);
     return buffer;
   }
 }
@@ -199,52 +209,103 @@ export async function processImageForPi(
 ): Promise<ImageContent | null> {
   const fullUrl = img.media?.full_url || img.url;
   if (!fullUrl) return null;
+  const { buffer, mimeType } = await downloadAndDecryptImage(img);
+  return bufferToBase64(buffer, mimeType);
+}
 
-  // Determine MIME type from URL or default
+// ── Shared image download pipeline ─────────────────────────────────────
+
+/**
+ * Download + decrypt + validate a WeChat image exactly once.
+ * Returns the decrypted buffer and the inferred MIME type.
+ * Throws if the image cannot be fetched or is not a valid image.
+ */
+async function downloadAndDecryptImage(img: ImageItem): Promise<{
+  buffer: Buffer;
+  mimeType: string;
+}> {
+  const fullUrl = img.media?.full_url || img.url;
+  if (!fullUrl) throw new Error("无法获取图片 URL");
+
   const mimeType = inferMimeType(fullUrl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
 
-  // Download
-  const rawBuffer = await downloadImage(fullUrl);
+  try {
+    const resp = await fetch(fullUrl, {
+      signal: controller.signal,
+      headers: { "User-Agent": USER_AGENT },
+      redirect: "follow",
+    });
 
-  // Decrypt if needed
-  const aesKey = img.media?.aes_key || img.aeskey;
-  const encryptType = img.media?.encrypt_type;
-  let decrypted = await decryptIfNeeded(rawBuffer, aesKey, encryptType);
-
-  // Validate: if decrypted data is not a valid image, try encrypt_query_param fallback
-  if (!isValidImageBuffer(decrypted)) {
-    const encryptQuery = img.media?.encrypt_query_param;
-    if (encryptQuery) {
-      try {
-        const sep = fullUrl.includes("?") ? "&" : "?";
-        const altUrl = fullUrl + sep + encryptQuery;
-        const altController = new AbortController();
-        const altTimer = setTimeout(() => altController.abort(), DOWNLOAD_TIMEOUT_MS);
-        const altResp = await fetch(altUrl, {
-          signal: altController.signal,
-          headers: { "User-Agent": USER_AGENT },
-          redirect: "follow",
-        });
-        clearTimeout(altTimer);
-        if (altResp.ok) {
-          const altBuf = Buffer.from(await altResp.arrayBuffer());
-          if (isValidImageBuffer(altBuf)) {
-            decrypted = altBuf;
-          }
-        }
-      } catch (altErr) {
-        console.error(`[media] processImageForPi: fallback error: ${altErr instanceof Error ? altErr.message : String(altErr)}`);
-      }
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
     }
-  }
 
-  // Final validation
-  if (!isValidImageBuffer(decrypted)) {
-    throw new Error(`图片数据无效 (header: ${decrypted.subarray(0, 8).toString("hex")})`);
-  }
+    const arrayBuffer = await resp.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
 
-  // Convert to base64 ImageContent
-  return bufferToBase64(decrypted, mimeType);
+    // Decrypt if needed
+    const aesKey = img.media?.aes_key || img.aeskey;
+    const encryptType = img.media?.encrypt_type;
+    let decrypted = await decryptIfNeeded(buffer, aesKey, encryptType);
+
+    // Fallback: WeChat CDN may require the encrypt_query_param in the URL
+    if (!isValidImageBuffer(decrypted)) {
+      decrypted = await tryEncryptQueryFallback(fullUrl, decrypted, img.media?.encrypt_query_param);
+    }
+
+    // Final validation
+    if (!isValidImageBuffer(decrypted)) {
+      throw new Error(`图片数据无效 (header: ${decrypted.subarray(0, 8).toString("hex")})`);
+    }
+
+    return { buffer: decrypted, mimeType };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Retry a download by rewriting / appending the encrypt_query_param.
+ * Returns the fallback buffer on success, otherwise the original buffer.
+ */
+async function tryEncryptQueryFallback(
+  fullUrl: string,
+  original: Buffer,
+  encryptQuery: string | undefined,
+): Promise<Buffer> {
+  if (!encryptQuery) return original;
+  try {
+    let altUrl = fullUrl;
+    if (altUrl.includes("encrypted_query_param=")) {
+      altUrl = altUrl.replace(/encrypted_query_param=[^&]*/, `encrypted_query_param=${encodeURIComponent(encryptQuery)}`);
+    } else {
+      const sep = altUrl.includes("?") ? "&" : "?";
+      altUrl = altUrl + sep + "encrypted_query_param=" + encodeURIComponent(encryptQuery);
+    }
+
+    const altController = new AbortController();
+    const altTimer = setTimeout(() => altController.abort(), DOWNLOAD_TIMEOUT_MS);
+    const altResp = await fetch(altUrl, {
+      signal: altController.signal,
+      headers: { "User-Agent": USER_AGENT },
+      redirect: "follow",
+    });
+    clearTimeout(altTimer);
+
+    if (altResp.ok) {
+      const altBuf = Buffer.from(await altResp.arrayBuffer());
+      if (isValidImageBuffer(altBuf)) {
+        return altBuf;
+      }
+    } else {
+      logger.warn(`fallback download failed: HTTP ${altResp.status}`);
+    }
+  } catch (altErr) {
+    logger.warn(`encrypt_query_param fallback error: ${altErr instanceof Error ? altErr.message : String(altErr)}`);
+  }
+  return original;
 }
 
 // ── File storage ───────────────────────────────────────────────────────
@@ -297,96 +358,55 @@ export async function saveImageLocally(img: ImageItem): Promise<string | null> {
   const fullUrl = img.media?.full_url || img.url;
   if (!fullUrl) return null;
 
-  ensureImageStorageDir();
-
-  // Determine MIME type and extension from URL
-  const mimeType = inferMimeType(fullUrl);
-  const ext = mimeType.split("/")[1] ?? "jpg";
-
-  // Build filename: timestamp_random.ext
-  const timestamp = new Date().toISOString()
-    .replace(/[:.]/g, "-")
-    .replace("T", "_")
-    .slice(0, 19); // YYYY-MM-DD_HH-MM-SS
-  const randomSuffix = Math.random().toString(36).slice(2, 8);
-  const fileName = `${timestamp}_${randomSuffix}.${ext}`;
-  const filePath = path.join(IMAGE_STORAGE_DIR, fileName);
-
-  // Download
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
-
   try {
-    const resp = await fetch(fullUrl, {
-      signal: controller.signal,
-      headers: { "User-Agent": USER_AGENT },
-      redirect: "follow",
-    });
+    const { buffer, mimeType } = await downloadAndDecryptImage(img);
+    ensureImageStorageDir();
 
-    if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
-    }
+    // Build filename: timestamp_random.ext
+    const timestamp = new Date().toISOString()
+      .replace(/[:.]/g, "-")
+      .replace("T", "_")
+      .slice(0, 19); // YYYY-MM-DD_HH-MM-SS
+    const randomSuffix = Math.random().toString(36).slice(2, 8);
+    const fileName = `${timestamp}_${randomSuffix}.${mimeType.split("/")[1] ?? "jpg"}`;
+    const filePath = path.join(IMAGE_STORAGE_DIR, fileName);
 
-    const arrayBuffer = await resp.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    // Decrypt if needed
-    const aesKey = img.media?.aes_key || img.aeskey;
-    const encryptType = img.media?.encrypt_type;
-    let decrypted = await decryptIfNeeded(buffer, aesKey, encryptType);
-
-    // Validate decrypted data looks like an image
-    if (!isValidImageBuffer(decrypted)) {
-      // Fallback: WeChat CDN may require replacing the encrypted_query_param in the URL
-      const encryptQuery = img.media?.encrypt_query_param;
-      if (encryptQuery) {
-        try {
-          // Strategy 1: replace encrypted_query_param value in URL
-          let altUrl = fullUrl;
-          if (altUrl.includes("encrypted_query_param=")) {
-            altUrl = altUrl.replace(/encrypted_query_param=[^&]*/, `encrypted_query_param=${encodeURIComponent(encryptQuery)}`);
-          } else {
-            const sep = altUrl.includes("?") ? "&" : "?";
-            altUrl = altUrl + sep + "encrypted_query_param=" + encodeURIComponent(encryptQuery);
-          }
-
-          const altController = new AbortController();
-          const altTimer = setTimeout(() => altController.abort(), DOWNLOAD_TIMEOUT_MS);
-          const altResp = await fetch(altUrl, {
-            signal: altController.signal,
-            headers: { "User-Agent": USER_AGENT },
-            redirect: "follow",
-          });
-          clearTimeout(altTimer);
-
-          if (altResp.ok) {
-            const altBuf = Buffer.from(await altResp.arrayBuffer());
-            if (isValidImageBuffer(altBuf)) {
-              decrypted = altBuf;
-            }
-          } else {
-            console.error(`[media] fallback download failed: HTTP ${altResp.status}`);
-          }
-        } catch (altErr) {
-          console.error(`[media] encrypt_query_param fallback error: ${altErr instanceof Error ? altErr.message : String(altErr)}`);
-        }
-      }
-    }
-
-    // Final validation: must be a valid image
-    if (!isValidImageBuffer(decrypted)) {
-      throw new Error(
-        `图片数据无效：解密后仍不是有效的图片格式 (header: ${decrypted.subarray(0, 8).toString("hex")})`,
-      );
-    }
-
-    fs.writeFileSync(filePath, decrypted);
+    fs.writeFileSync(filePath, buffer);
     return filePath;
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     throw new Error(`图片下载失败: ${errMsg}`);
-  } finally {
-    clearTimeout(timer);
+  }
+}
+
+/**
+ * Download a WeChat image exactly once, save it locally, and return BOTH
+ * the local path and its base64 ImageContent. Used by the daemon so the
+ * vision-attach flow doesn't download the same image twice.
+ */
+export async function downloadImageForWeixin(
+  img: ImageItem,
+): Promise<{ path: string; content: ImageContent } | null> {
+  const fullUrl = img.media?.full_url || img.url;
+  if (!fullUrl) return null;
+
+  try {
+    const { buffer, mimeType } = await downloadAndDecryptImage(img);
+    ensureImageStorageDir();
+
+    const timestamp = new Date().toISOString()
+      .replace(/[:.]/g, "-")
+      .replace("T", "_")
+      .slice(0, 19);
+    const randomSuffix = Math.random().toString(36).slice(2, 8);
+    const fileName = `${timestamp}_${randomSuffix}.${mimeType.split("/")[1] ?? "jpg"}`;
+    const filePath = path.join(IMAGE_STORAGE_DIR, fileName);
+
+    fs.writeFileSync(filePath, buffer);
+    return { path: filePath, content: bufferToBase64(buffer, mimeType) };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    throw new Error(`图片下载失败: ${errMsg}`);
   }
 }
 
@@ -457,7 +477,7 @@ export async function saveVoiceLocally(voice: VoiceItem): Promise<string | null>
             decrypted = altBuf;
           }
         } catch (altErr) {
-          console.error(`[media] voice encrypt_query_param fallback error: ${altErr instanceof Error ? altErr.message : String(altErr)}`);
+          logger.warn(`voice encrypt_query_param fallback error: ${altErr instanceof Error ? altErr.message : String(altErr)}`);
         }
       }
     }
@@ -538,7 +558,7 @@ export async function saveVideoLocally(video: VideoItem): Promise<string | null>
           decrypted = altBuf;
         }
       } catch (altErr) {
-        console.error(`[media] video encrypt_query_param fallback error: ${altErr instanceof Error ? altErr.message : String(altErr)}`);
+        logger.warn(`video encrypt_query_param fallback error: ${altErr instanceof Error ? altErr.message : String(altErr)}`);
       }
     }
 
@@ -621,7 +641,7 @@ export async function saveFileLocally(file: FileItem): Promise<string | null> {
             }
           }
         } catch (altErr) {
-          console.error(`[media] file encrypt_query_param fallback error: ${altErr instanceof Error ? altErr.message : String(altErr)}`);
+          logger.warn(`file encrypt_query_param fallback error: ${altErr instanceof Error ? altErr.message : String(altErr)}`);
         }
       }
     }

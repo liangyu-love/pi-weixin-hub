@@ -185,17 +185,17 @@ pi-weixin-cli 支持将 Pi 的终端交互操作桥接到微信：
 
 ### 图片消息支持
 
-pi-weixin-hub 支持接收微信图片并自动触发 **vision 视觉分析**：
+pi-weixin-hub 支持接收微信图片并**自适应处理**：
 - 微信图片下载后保存到 `~/.config/pi-weixin-cli/images/`
 - 在 prompt 中告知 Pi 图片的本地文件路径，Pi 可自行用 `read` 或 vision 工具处理
-- **视觉子代理（默认开启）**：收到图片时，自动指示 Pi 调用 `vision` 子代理
-  （`~/.pi/agent/agents/vision.md`，使用多模态模型如 gpt-5.6-luna）分析图片，
-  文本模型也能“看懂”图片内容
-- 支持 WeChat CDN 加密图片的自动解密（AES-128-ECB）
+- **自动检测模型能力（默认开启）**：收到图片时，会查询当前模型是否支持图片输入——
+  - 主模型支持视觉（`model.input` 含 `image`，如 gpt-4-turbo、GLM-5.2）→ 图片以 base64 **直接附加**到 prompt，无需子代理
+  - 主模型不支持视觉（如 deepseek-v4-flash）→ 自动指示 Pi 调用 `vision` 子代理
+    （`~/.pi/agent/agents/vision.md`，使用多模态模型如 gpt-5.6-luna）分析图片
+- 支持 WeChat CDN 加密图片的自动解密（AES-128-ECB），下载仅发生一次（文件 + base64 复用同一份数据）
 - 纯图片消息也会被处理，不依赖文字内容
 
-> 若你的默认模型本身支持图片输入，可将 `attachImages` 设为 `true`，图片会以
-> base64 直接附加到 prompt（无需子代理）；或将 `visionAgent` 设为 `false` 关闭自动分析。
+> `visionAgent` 关闭后不附加任何分析指令；`attachImages` 设为 `true` 可强制以 base64 直接附加（覆盖自动检测）。
 
 示例：用户发送一张图片，Pi 收到的消息为：
 
@@ -296,9 +296,9 @@ pi-weixin-cli 支持接收微信视频消息：
 | `replyPrefix` | string | `"🤖 "` | AI 回复的 emoji 状态前缀 |
 | `logLevel` | string | `"info"` | 日志级别：`debug` / `info` / `warn` / `error` |
 | `persistentSession` | boolean | `true` | 重启 daemon 后自动恢复上次的会话上下文 |
-| `visionAgent` | boolean | `true` | 收到图片时指示 Pi 调用 vision 子代理分析 |
+| `visionAgent` | boolean | `true` | 图片分析开关：自动检测模型能力，视觉模型直接附加、文本模型走 vision 子代理 |
 | `visionSubagent` | string | `"vision"` | vision 子代理名称 |
-| `attachImages` | boolean | `false` | 图片以 base64 直接附加到 prompt（视觉模型） |
+| `attachImages` | boolean | `false` | 强制以 base64 直接附加图片（覆盖自动检测） |
 
 所有配置项都可通过 `config set` 命令动态修改（如 `pi-weixin-hub config set logLevel debug`），
 下次启动时生效。日志级别也可用 `LOG_LEVEL` 环境变量覆盖（优先级更高）。

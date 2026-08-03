@@ -30,7 +30,7 @@ export interface ClassifiedError {
 export function classifyError(err: unknown): ClassifiedError {
   const text = normalizeErrorText(err);
 
-  if (matches(text, ["429", "rate.?limit", "overload", "quota", "限流", "频率", "too many requests", "rate_limit"])) {
+  if (matches(text, ["\\b429\\b", "rate.?limit", "overload", "quota", "限流", "频率", "too many requests", "rate_limit"])) {
     return {
       category: "rate-limit",
       emoji: "⏳",
@@ -48,7 +48,7 @@ export function classifyError(err: unknown): ClassifiedError {
     };
   }
 
-  if (matches(text, ["401", "403", "permission", "forbidden", "unauthorized", "api.?key", "invalid.?key", "无权限", "权限不足", "认证失败", "not authorized"])) {
+  if (matches(text, ["\\b401\\b", "\\b403\\b", "permission", "forbidden", "unauthorized", "api.?key", "invalid.?key", "无权限", "权限不足", "认证失败", "not authorized"])) {
     return {
       category: "permission",
       emoji: "🔒",
@@ -57,7 +57,7 @@ export function classifyError(err: unknown): ClassifiedError {
     };
   }
 
-  if (matches(text, ["model not found", "unsupported model", "invalid model", "does not support", "not support image", "no vision", "vision", "image input", "model.?not.?found", "未知模型", "不支持的模型", "not found.*model", "400"])) {
+  if (matches(text, ["model not found", "unsupported model", "invalid model", "does not support", "not support image", "\\bvision\\b", "image input", "model.?not.?found", "未知模型", "不支持的模型", "not found.*model", "\\b400\\b"])) {
     return {
       category: "model",
       emoji: "🧠",
@@ -66,7 +66,7 @@ export function classifyError(err: unknown): ClassifiedError {
     };
   }
 
-  if (matches(text, ["50[0-9]", "5xx", "internal server", "internal_error", "temporarily", "unavailable", "服务端", "服务器错误", "overloaded_error", "529", "520", "503", "502", "500"])) {
+  if (matches(text, ["\\b50[0-9]\\b", "5xx", "internal server", "internal_error", "temporarily", "unavailable", "服务端", "服务器错误", "overloaded_error", "\\b529\\b", "\\b520\\b", "\\b521\\b", "\\b522\\b"])) {
     return {
       category: "server",
       emoji: "🔧",
