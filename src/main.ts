@@ -35,7 +35,8 @@ import { WeixinApi } from "./api.js";
 import { Poller, type MessageCallback, type LogCallback } from "./poller.js";
 import { RpcClient, setRpcLogLevel } from "./rpc-client.js";
 import { loadAccounts, saveContextToken, loadContextTokens, loadUserSession, saveUserSession } from "./storage.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, saveConfig } from "./config.js";
+import { startWebhookServer, type WebhookServer } from "./webhook.js";
 import { Logger, resolveLogLevel } from "./logger.js";
 import { formatAndSplit } from "./format-reply.js";
 import { classifyError, formatClassifiedError } from "./error-classifier.js";
@@ -402,6 +403,13 @@ async function runDaemon(): Promise<void> {
   let turnData: { messages: unknown[] | undefined; aborted: boolean } | null = null;
   /** Backstop timer if agent_settled never arrives after a retrying run. */
   let turnWatchdog: ReturnType<typeof setTimeout> | null = null;
+
+  /** Most recent routing context per account (for webhook default target). */
+  const lastSenders = new Map<string, PendingContext>();
+  /** Most recent sender across all accounts (webhook default target). */
+  let lastSenderGlobal: PendingContext | null = null;
+  /** Running webhook server (started when config.webhookPort > 0). */
+  let webhookServer: WebhookServer | null = null;
 
   /** Pending model selections: userId → models array (for /model flow). */
   const pendingModelSelections = new Map<string, unknown[]>();
@@ -1228,6 +1236,11 @@ async function runDaemon(): Promise<void> {
     // Load latest context token from storage (may have been updated)
     const tokens = loadContextTokens(account.id);
     const latestToken = tokens[userId] ?? contextToken;
+
+    // Track the most recent routing context (webhook default target)
+    const senderCtx: PendingContext = { account, userId, contextToken: latestToken, sessionId, sessionKey };
+    lastSenders.set(account.id, senderCtx);
+    lastSenderGlobal = senderCtx;
 
     // ── Pending model selection check (for /model flow) ─────────────
     const pendingModels = pendingModelSelections.get(userId);
@@ -2133,6 +2146,83 @@ async function runDaemon(): Promise<void> {
 
   log(`${pollers.length} 个轮询器已启动`);
 
+  // ── Webhook API (Pi extensions / scripts can push messages) ──────────
+
+  /** Resolve the target routing context for a webhook push. */
+  function resolveWebhookTarget(user: string): PendingContext | null {
+    if (user) {
+      // Explicit user: look up their saved context token on any account
+      for (const account of accounts) {
+        const tokens = loadContextTokens(account.id);
+        if (tokens[user]) {
+          return { account, userId: user, contextToken: tokens[user], sessionId: "", sessionKey: "" };
+        }
+      }
+      return null;
+    }
+    return lastSenderGlobal ?? (lastSenders.size > 0 ? lastSenders.values().next().value as PendingContext : null);
+  }
+
+  /** Webhook /send and /notify handler (same formatting pipeline as replies). */
+  async function sendWebhookText(
+    user: string,
+    text: string,
+    asNotify: boolean,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const target = resolveWebhookTarget(user);
+    if (!target) {
+      return { ok: false, error: "没有可用的接收者（用户尚未发过消息，或未指定 user）" };
+    }
+    const prefix = asNotify ? "⚡ " : (config.replyPrefix ?? "");
+    const chunks = formatAndSplit(text, config.maxReplyLength ?? 2000);
+    for (const chunk of chunks) {
+      await sendWeixinReply(
+        api, target.account, target.userId, target.contextToken, target.sessionId,
+        `${prefix}${chunk}`,
+      );
+    }
+    return { ok: true };
+  }
+
+  /** Webhook /media handler. */
+  async function sendWebhookMedia(
+    user: string,
+    media: { type?: string; url: string; caption?: string },
+  ): Promise<{ ok: boolean; error?: string }> {
+    const target = resolveWebhookTarget(user);
+    if (!target) {
+      return { ok: false, error: "没有可用的接收者（用户尚未发过消息，或未指定 user）" };
+    }
+    await sendWeixinMedia(target.account, target.userId, target.contextToken, target.sessionId, {
+      type: media.type,
+      url: media.url,
+      caption: media.caption,
+    });
+    return { ok: true };
+  }
+
+  const webhookPort = config.webhookPort ?? 0;
+  if (webhookPort > 0) {
+    try {
+      if (!config.webhookToken) {
+        config.webhookToken = crypto.randomBytes(16).toString("hex");
+        saveConfig(config);
+      }
+      webhookServer = await startWebhookServer(
+        config.webhookToken,
+        {
+          sendText: (user, text) => sendWebhookText(user, text, false),
+          sendNotify: (user, text) => sendWebhookText(user, text, true),
+          sendMedia: (user, media) => sendWebhookMedia(user, media),
+        },
+        webhookPort,
+      );
+      log(`[webhook] HTTP API 已启动: http://127.0.0.1:${webhookServer.port} (token: ${config.webhookToken.slice(0, 6)}...)`);
+    } catch (err) {
+      logWarn(`[webhook] 启动失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // ── Graceful Shutdown ────────────────────────────────────────────────
 
   async function shutdown(signal: string): Promise<void> {
@@ -2146,6 +2236,13 @@ async function runDaemon(): Promise<void> {
       poller.stop();
     }
     log("所有轮询器已停止");
+
+    // Close the webhook server
+    if (webhookServer) {
+      await webhookServer.close();
+      webhookServer = null;
+      log("[webhook] HTTP API 已关闭");
+    }
 
     // Notify backend that we're going offline
     for (const account of accounts) {

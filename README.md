@@ -313,6 +313,8 @@ pi-weixin-cli 支持接收微信视频消息：
 | `allowlist` | string[] | `[]` | 允许使用 bot 的用户 ID 列表；空 = 允许所有用户 |
 | `blocklist` | string[] | `[]` | 拉黑用户 ID 列表（消息被静默忽略） |
 | `rateLimitMax` | number | `0` | 每用户每分钟最大消息数（`0` = 不限） |
+| `webhookPort` | number | `0` | 本地 webhook 端口（`0` = 禁用）；供 Pi 扩展/脚本主动推送 |
+| `webhookToken` | string | `""` | webhook 访问令牌（空 = daemon 启动时自动生成） |
 | `groupChat` | boolean | `false` | 是否响应群聊消息 |
 | `botName` | string | `""` | 群聊触发昵称（消息需含 `@botName`；空 = 处理所有群消息） |
 | `maxReplyLength` | number | `2000` | 单条回复最大字符数，超过自动拆分（`0` = 不拆分） |
@@ -348,6 +350,46 @@ Pi 可以在回合中把图片/文件**主动发送**给用户：把 JSON 清单
 - `type`: `image`（默认）或 `file`
 - `url`: 用户可访问的网络地址（当前 iLink API 仅支持 URL 媒体，本地文件上传待验证）
 - 也可直接使用微信内命令 `/send-image <url>` 或 `/send-file <url> [name]`
+
+## 主动推送（Webhook + Pi 扩展）
+
+Pi 可以**主动**给用户发消息（无需等待用户先发消息），通过 daemon 的本地 webhook：
+
+```bash
+pi-weixin-hub config set webhookPort 8787   # 启用（令牌自动生成并显示在 config show）
+pi-weixin-hub daemon
+```
+
+### Webhook API（仅监听 127.0.0.1，需 Bearer 令牌）
+
+| 端点 | 请求体 | 说明 |
+|------|--------|------|
+| `POST /send` | `{ user?, text }` | 格式化文本推送（带回复前缀） |
+| `POST /notify` | `{ user?, text }` | 信息推送（⚡ 前缀） |
+| `POST /media` | `{ user?, url, type?, caption? }` | 图片/文件推送 |
+
+`user` 省略时发给最近发过消息的用户；`user` 指定时按已保存的 context token 定位。
+
+```bash
+curl -X POST http://127.0.0.1:8787/send \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"text":"任务完成！"}'
+```
+
+### Pi 扩展（让模型主动调用）
+
+仓库中的 `extension/pi-weixin-hub.ts` 注册了 `weixin_send` / `weixin_media` 工具与
+`/weixin-send` / `/weixin-media` 命令：
+
+```bash
+# 安装（也可用 pi -e ./extension/pi-weixin-hub.ts 临时测试）
+cp extension/pi-weixin-hub.ts ~/.pi/agent/extensions/
+```
+
+- **模型调用**：向 Pi 发送 `/weixin-send <文本>`（扩展命令即使在流式处理中也会立即执行）
+- **工具**：`weixin_send({text, user?})`、`weixin_media({url, type?, caption?, user?})` 按 pi 扩展工具 API 注册
+
+> 注意：webhook 仅绑定回环地址；令牌由 daemon 自动生成。若不需要，将 `webhookPort` 设为 `0`。
 
 ## 状态面板（Step 12）
 
