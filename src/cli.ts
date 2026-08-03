@@ -20,6 +20,7 @@ import {
   setConfigValue,
   describeConfig,
 } from "./config.js";
+import { runDoctor } from "./doctor.js";
 
 // ── Help ──────────────────────────────────────────────────────────────
 
@@ -32,6 +33,7 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   login              使用手机微信扫描二维码登录账号
   logout [id]        登出账号。不指定 id 时列出所有账号；使用 --all 删除全部
   status             显示所有已登录账号及其状态
+  doctor             运行环境自检（pi 路径/配置/账号/网络/daemon）
   toggle             切换消息接收功能（启用/禁用）
   config show        显示当前配置
   config set <k> <v> 修改配置项（如 allowlist、groupChat、maxReplyLength）
@@ -50,6 +52,10 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   webhookToken       webhook 访问令牌（空=daemon 启动时自动生成）
   persona            人设（注入到每条 prompt 的系统信息）
   autoCompactThreshold  上下文使用率自动压缩阈值 (0-100, 0=禁用)
+  logFile           日志文件路径（空=仅 stderr）
+  logMaxBytes       日志轮转大小（字节）
+  retentionDays     媒体/会话保留天数 (0=不清理)
+  queueTtlMin       队列消息有效期（分钟）
   groupChat          群聊模式 (true/false)
   botName            群聊 @ 触发昵称 (如 "mybot"，空=处理所有群消息)
   maxReplyLength     单条回复最大字符数 (0=不拆分)
@@ -324,6 +330,9 @@ export async function runCLI(args: string[]): Promise<number> {
 
     case "status":
       return handleStatus();
+
+    case "doctor":
+      return await runDoctor();
 
     case "toggle":
       return handleToggle();

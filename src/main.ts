@@ -34,10 +34,10 @@ import { fileURLToPath } from "node:url";
 import { WeixinApi } from "./api.js";
 import { Poller, type MessageCallback, type LogCallback } from "./poller.js";
 import { RpcClient, setRpcLogLevel } from "./rpc-client.js";
-import { loadAccounts, saveContextToken, loadContextTokens, loadUserSession, saveUserSession } from "./storage.js";
+import { loadAccounts, saveContextToken, loadContextTokens, loadUserSession, saveUserSession, pruneSessionMap } from "./storage.js";
 import { loadConfig, saveConfig } from "./config.js";
 import { startWebhookServer, type WebhookServer } from "./webhook.js";
-import { Logger, resolveLogLevel } from "./logger.js";
+import { Logger, resolveLogLevel, setLogFile } from "./logger.js";
 import { formatAndSplit } from "./format-reply.js";
 import { classifyError, formatClassifiedError } from "./error-classifier.js";
 import { buildContextPrefix, enrichMessageText, memoryFilePath, readMemoryFile } from "./context.js";
@@ -70,6 +70,8 @@ interface QueuedMessage {
   /** Session routing key ("" = default/private, otherwise a from_user_id). */
   sessionKey: string;
   text: string;
+  /** Enqueue time (ms) — used for crash-recovery TTL. */
+  createdAt?: number;
   /** Optional image item from the WeChat message. */
   imageItem?: ImageItem;
   /** Optional file item from the WeChat message. */
@@ -195,6 +197,10 @@ async function runDaemon(): Promise<void> {
   logger.setLevel(effectiveLogLevel);
   setMediaLogLevel(effectiveLogLevel);
   setRpcLogLevel(effectiveLogLevel);
+  if (config.logFile) {
+    setLogFile(config.logFile, config.logMaxBytes ?? 5 * 1024 * 1024);
+    log(`[log] 日志文件: ${config.logFile} (轮转上限 ${((config.logMaxBytes ?? 5 * 1024 * 1024) / 1024 / 1024).toFixed(1)}MB)`);
+  }
 
   // ── Respect config.enabled ───────────────────────────────────────────
   if (!config.enabled) {
@@ -213,6 +219,46 @@ async function runDaemon(): Promise<void> {
   }
 
   log(`已加载 ${accounts.length} 个微信账号: ${accounts.map((a) => a.id).join(", ")}`);
+
+  // ── Media / session retention (D3) ───────────────────────────────────
+  const RETENTION_DIRS = ["images", "files", "voices", "videos"];
+
+  /** Delete media files and session-map entries older than `days`. */
+  function pruneRetention(days: number): void {
+    if (days <= 0) return;
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const base = path.join(os.homedir(), ".config", "pi-weixin-cli");
+    let removed = 0;
+    for (const dir of RETENTION_DIRS) {
+      const dirPath = path.join(base, dir);
+      try {
+        if (!fs.existsSync(dirPath)) continue;
+        for (const file of fs.readdirSync(dirPath)) {
+          try {
+            if (fs.statSync(path.join(dirPath, file)).mtimeMs < cutoff) {
+              fs.unlinkSync(path.join(dirPath, file));
+              removed++;
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const account of accounts) {
+      try {
+        removed += pruneSessionMap(account.id, cutoff);
+      } catch {
+        /* ignore */
+      }
+    }
+    if (removed > 0) log(`[retention] 已清理 ${removed} 个超过 ${days} 天的媒体/会话文件`);
+  }
+
+  pruneRetention(config.retentionDays ?? 30);
+  setInterval(() => pruneRetention(config.retentionDays ?? 30), 24 * 60 * 60 * 1000).unref();
 
   // ── Default model + persistent session helpers ───────────────────────
 
@@ -397,6 +443,66 @@ async function runDaemon(): Promise<void> {
 
   /** Queue of messages waiting to be sent to Pi. */
   const messageQueue: QueuedMessage[] = [];
+
+  // ── Persistent message queue (crash recovery, D4) ───────────────────
+  const QUEUE_FILE = path.join(os.homedir(), ".config", "pi-weixin-cli", "queue.jsonl");
+
+  /** Persist the in-memory queue to disk (tmp + rename, small queues). */
+  function persistQueueNow(): void {
+    try {
+      const tmp = `${QUEUE_FILE}.tmp`;
+      const lines = messageQueue.map((m) => JSON.stringify(m));
+      fs.writeFileSync(tmp, lines.length > 0 ? lines.join("\n") + "\n" : "", "utf-8");
+      fs.renameSync(tmp, QUEUE_FILE);
+    } catch {
+      /* best effort */
+    }
+  }
+
+  /** Enqueue a message and persist. */
+  function enqueueMessage(qm: QueuedMessage): void {
+    messageQueue.push({ ...qm, createdAt: qm.createdAt ?? Date.now() });
+    persistQueueNow();
+  }
+
+  /** Dequeue the next message and persist. */
+  function dequeueMessage(): QueuedMessage | undefined {
+    const next = messageQueue.shift();
+    persistQueueNow();
+    return next;
+  }
+
+  /** Load persisted messages from a previous run (TTL-filtered). */
+  function loadPersistedQueue(): void {
+    const ttlMin = config.queueTtlMin ?? 30;
+    const cutoff = Date.now() - ttlMin * 60_000;
+    try {
+      if (!fs.existsSync(QUEUE_FILE)) return;
+      const lines = fs.readFileSync(QUEUE_FILE, "utf-8").split("\n").filter(Boolean);
+      let loaded = 0;
+      for (const line of lines) {
+        try {
+          const qm = JSON.parse(line) as QueuedMessage;
+          const createdAt = qm.createdAt ?? 0;
+          if (ttlMin > 0 && createdAt && createdAt < cutoff) continue; // stale
+          messageQueue.push(qm);
+          loaded++;
+        } catch {
+          /* skip malformed */
+        }
+      }
+      fs.rmSync(QUEUE_FILE, { force: true });
+      if (loaded > 0) {
+        log(`[queue] 已从磁盘恢复 ${loaded} 条未处理消息`);
+      }
+    } catch (err) {
+      logWarn(`[queue] 队列恢复失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // ── Recover the persisted message queue from a previous run (D4) ─────
+  // Must run after QUEUE_FILE/messageQueue are declared.
+  loadPersistedQueue();
 
   /** Context of the currently processing WeChat message. */
   let pendingContext: PendingContext | null = null;
@@ -891,7 +997,7 @@ async function runDaemon(): Promise<void> {
             return;
           }
           if (rpcClient.isStreaming || processingWeixin) {
-            messageQueue.push({ account, userId, contextToken, sessionId, sessionKey, text: `/image ${url}` });
+            enqueueMessage({ account, userId, contextToken, sessionId, sessionKey, text: `/image ${url}` });
             await sendWeixinReply(api, account, userId, contextToken, sessionId, "⏳ 当前任务进行中，图片分析已排队");
             return;
           }
@@ -942,7 +1048,7 @@ async function runDaemon(): Promise<void> {
           }
           const text = `请联网搜索并总结：${query}\n\n【要求】使用可用的搜索工具/技能查找最新信息，用中文总结要点，并注明来源。`;
           if (rpcClient.isStreaming || processingWeixin) {
-            messageQueue.push({ account, userId, contextToken, sessionId, sessionKey, text });
+            enqueueMessage({ account, userId, contextToken, sessionId, sessionKey, text });
             await sendWeixinReply(api, account, userId, contextToken, sessionId, "⏳ 当前任务进行中，搜索已排队");
           } else {
             void injectMessage({
@@ -1396,7 +1502,7 @@ async function runDaemon(): Promise<void> {
       // other users' messages are queued until the turn completes.
       if (pendingContext && userId !== pendingContext.userId) {
         logDebug(`[weixin] 用户 ${userId} 的消息在 UI 等待期间被排队`);
-        messageQueue.push({
+        enqueueMessage({
           account, userId, contextToken: latestToken, sessionId, sessionKey,
           text: enrichMessageText(msg, text), imageItem, fileItem, voiceItem, videoItem,
         });
@@ -1443,7 +1549,7 @@ async function runDaemon(): Promise<void> {
     } else {
       // Pi is busy or already processing — queue
       log(`[weixin] Pi 忙碌，消息入队 (队列长度: ${messageQueue.length + 1})`);
-      messageQueue.push({
+      enqueueMessage({
         account,
         userId,
         contextToken: latestToken,
@@ -1657,7 +1763,7 @@ async function runDaemon(): Promise<void> {
     // Don't dequeue while Pi is busy or waiting for user input
     if (rpcClient.isStreaming || sm.isWaitingUIResponse) return;
 
-    const next = messageQueue.shift()!;
+    const next = dequeueMessage()!;
     log(`[weixin] 队列有 ${messageQueue.length + 1} 条消息，注入下一条`);
     setImmediate(() => {
       injectMessage(next).catch((err) => log(`[weixin] 队列注入失败: ${err instanceof Error ? err.message : String(err)}`));
@@ -2104,6 +2210,11 @@ async function runDaemon(): Promise<void> {
     // ── Reset volatile state ──────────────────────────────────────────
     sm.setIdle();
     messageQueue.length = 0;
+    try {
+      fs.rmSync(QUEUE_FILE, { force: true });
+    } catch {
+      /* ignore */
+    }
     pendingContext = null;
     processingWeixin = false;
     turnData = null;

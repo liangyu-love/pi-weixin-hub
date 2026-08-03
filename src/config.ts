@@ -33,6 +33,14 @@ export interface WeixinConfig {
   persona?: string;
   /** 上下文使用率达到该百分比时自动压缩（0 = 禁用）。 */
   autoCompactThreshold?: number;
+  /** 日志文件路径（空 = 仅 stderr）。 */
+  logFile?: string;
+  /** 日志文件轮转大小（字节）。 */
+  logMaxBytes?: number;
+  /** 媒体/会话保留天数（0 = 不清理）。 */
+  retentionDays?: number;
+  /** 崩溃恢复时队列消息的有效时长（分钟）。 */
+  queueTtlMin?: number;
   /** 本地 webhook 端口（0 = 禁用）；供 Pi 扩展/脚本主动推送消息。 */
   webhookPort?: number;
   /** webhook 访问令牌（空则 daemon 启动时自动生成）。 */
@@ -67,6 +75,10 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   rateLimitMax: 0,
   persona: "",
   autoCompactThreshold: 80,
+  logFile: "",
+  logMaxBytes: 5 * 1024 * 1024,
+  retentionDays: 30,
+  queueTtlMin: 30,
   webhookPort: 0,
   webhookToken: "",
   groupChat: false,
@@ -157,6 +169,31 @@ export function setConfigValue(
       config.persona = rawValue;
       return null;
 
+    case "logFile":
+      config.logFile = rawValue.trim() || undefined;
+      return null;
+
+    case "logMaxBytes": {
+      const n = parseInt(rawValue, 10);
+      if (isNaN(n) || n < 0) return `logMaxBytes 必须是 >= 0 的数字`;
+      config.logMaxBytes = n;
+      return null;
+    }
+
+    case "retentionDays": {
+      const n = parseInt(rawValue, 10);
+      if (isNaN(n) || n < 0) return `retentionDays 必须是 >= 0 的数字（0=不清理）`;
+      config.retentionDays = n;
+      return null;
+    }
+
+    case "queueTtlMin": {
+      const n = parseInt(rawValue, 10);
+      if (isNaN(n) || n < 0) return `queueTtlMin 必须是 >= 0 的数字（0=不过期）`;
+      config.queueTtlMin = n;
+      return null;
+    }
+
     case "autoCompactThreshold": {
       const n = parseInt(rawValue, 10);
       if (isNaN(n) || n < 0 || n > 100) return `autoCompactThreshold 必须是 0-100 的数字（0=禁用）`;
@@ -244,6 +281,10 @@ export function describeConfig(config: WeixinConfig): string {
   label("rateLimitMax", config.rateLimitMax && config.rateLimitMax > 0 ? `${config.rateLimitMax} 条/分钟` : "(不限)");
   label("persona", config.persona ? config.persona : "(无)");
   label("autoCompactThreshold", config.autoCompactThreshold && config.autoCompactThreshold > 0 ? `${config.autoCompactThreshold}%` : "(禁用)");
+  label("logFile", config.logFile ?? "(仅 stderr)");
+  label("logMaxBytes", config.logMaxBytes ? `${(config.logMaxBytes / 1024 / 1024).toFixed(1)}MB` : "(无限)");
+  label("retentionDays", config.retentionDays && config.retentionDays > 0 ? `${config.retentionDays} 天` : "(不清理)");
+  label("queueTtlMin", config.queueTtlMin && config.queueTtlMin > 0 ? `${config.queueTtlMin} 分钟` : "(不过期)");
   label("webhookPort", config.webhookPort && config.webhookPort > 0 ? `127.0.0.1:${config.webhookPort}` : "(禁用)");
   label("webhookToken", config.webhookToken ? `${config.webhookToken.slice(0, 6)}...` : "(自动生成)");
   label("groupChat", config.groupChat ? "启用" : "禁用（忽略群消息）");

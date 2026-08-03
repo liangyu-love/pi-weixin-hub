@@ -11,6 +11,8 @@
 // All output goes to stderr so stdout stays clean for RPC JSONL.
 
 import process from "node:process";
+import fs from "node:fs";
+import path from "node:path";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -43,6 +45,59 @@ function toLocalISOString(d: Date): string {
     `${String(d.getMilliseconds()).padStart(3, "0")}${tz}`;
 }
 
+// ── File sink (shared across all Logger instances) ─────────────────────
+// Optional file logging with size-based rotation: file, file.1, file.2.
+
+let logFilePath: string | null = null;
+let logFileMaxBytes = 5 * 1024 * 1024;
+
+/**
+ * Enable file logging for all loggers with size-based rotation.
+ * Keeps at most 2 backups (file.1, file.2). Pass maxBytes=0 to disable rotation.
+ */
+export function setLogFile(filePath: string, maxBytes = 5 * 1024 * 1024): void {
+  logFilePath = filePath;
+  logFileMaxBytes = maxBytes > 0 ? maxBytes : 5 * 1024 * 1024;
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  } catch {
+    /* ignore */
+  }
+}
+
+function rotateIfNeeded(): void {
+  if (!logFilePath) return;
+  try {
+    if (!fs.existsSync(logFilePath)) return;
+    if (fs.statSync(logFilePath).size < logFileMaxBytes) return;
+    const f1 = `${logFilePath}.1`;
+    const f2 = `${logFilePath}.2`;
+    try {
+      if (fs.existsSync(f2)) fs.unlinkSync(f2);
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (fs.existsSync(f1)) fs.renameSync(f1, f2);
+    } catch {
+      /* ignore */
+    }
+    fs.renameSync(logFilePath, f1);
+  } catch {
+    /* ignore */
+  }
+}
+
+function writeToFile(line: string): void {
+  if (!logFilePath) return;
+  rotateIfNeeded();
+  try {
+    fs.appendFileSync(logFilePath, line);
+  } catch {
+    /* ignore */
+  }
+}
+
 // ── Logger ─────────────────────────────────────────────────────────────
 
 export class Logger {
@@ -70,7 +125,9 @@ export class Logger {
     if (!this.isEnabled(level)) return;
     const ts = toLocalISOString(new Date());
     const levelTag = LEVEL_NAMES[level];
-    process.stderr.write(`[${ts}] [${levelTag}]${this.tag} ${msg}\n`);
+    const line = `[${ts}] [${levelTag}]${this.tag} ${msg}\n`;
+    process.stderr.write(line);
+    writeToFile(line);
   }
 
   debug(msg: string): void {

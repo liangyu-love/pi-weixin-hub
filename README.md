@@ -317,6 +317,10 @@ pi-weixin-cli 支持接收微信视频消息：
 | `webhookToken` | string | `""` | webhook 访问令牌（空 = daemon 启动时自动生成） |
 | `persona` | string | `""` | 人设：注入到每条 prompt 的系统信息 |
 | `autoCompactThreshold` | number | `80` | 上下文使用率 ≥ 该百分比时自动压缩（`0` = 禁用） |
+| `logFile` | string | `""` | 日志文件路径（空 = 仅 stderr） |
+| `logMaxBytes` | number | `5242880` | 日志轮转大小（字节，保留 2 个备份） |
+| `retentionDays` | number | `30` | 媒体/会话保留天数（`0` = 不清理） |
+| `queueTtlMin` | number | `30` | 崩溃恢复时队列消息有效期（分钟，`0` = 不过期） |
 | `groupChat` | boolean | `false` | 是否响应群聊消息 |
 | `botName` | string | `""` | 群聊触发昵称（消息需含 `@botName`；空 = 处理所有群消息） |
 | `maxReplyLength` | number | `2000` | 单条回复最大字符数，超过自动拆分（`0` = 不拆分） |
@@ -399,6 +403,13 @@ cp extension/pi-weixin-hub.ts ~/.pi/agent/extensions/
 - **人设**：`config set persona "你是我的微信私人助理"`，每条 prompt 自动注入
 - **长期记忆**：编辑 `~/.config/pi-weixin-cli/memory.md`（或直接告诉 Pi 更新它），内容会随每条 prompt 注入；`/memory` 命令可查看
 - **自动压缩**：上下文使用率 ≥ `autoCompactThreshold`（默认 80%）时，下一条消息前自动 `/compact`，避免长对话触发上下文溢出
+
+## 可靠性（Phase D）
+
+- **`pi-weixin-hub doctor`**：一键自检 pi 路径、配置、账号、网络连通、daemon 状态、目录可写，逐项 ✅/❌ 输出
+- **日志文件**：`config set logFile /path/to/daemon.log` 后所有日志同时写入文件，超过 `logMaxBytes`（默认 5MB）自动轮转（保留 `.1`/`.2` 备份）
+- **自动清理**：`retentionDays`（默认 30）定期删除过期的图片/文件/语音/视频与会话映射
+- **崩溃恢复**：未处理消息实时持久化到 `queue.jsonl`，重启自动恢复（超过 `queueTtlMin` 的过期消息丢弃）
 
 ## 状态面板（Step 12）
 

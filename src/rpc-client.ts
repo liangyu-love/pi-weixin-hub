@@ -52,13 +52,13 @@ interface ResolvedTarget {
 }
 
 /** PATH entries, split per platform. */
-function pathEntries(): string[] {
+export function pathEntries(): string[] {
   const raw = process.env.PATH ?? "";
   return raw.split(path.delimiter).filter(Boolean);
 }
 
 /** Find `pi` (or pi.exe/.cmd/.bat on Windows) on PATH. */
-function findPiOnPath(): string | null {
+export function findPiOnPath(): string | null {
   const isWin = process.platform === "win32";
   const names = isWin ? ["pi.exe", "pi.cmd", "pi.bat", "pi"] : ["pi"];
   for (const dir of pathEntries()) {
@@ -83,7 +83,7 @@ function findPiOnPath(): string | null {
  *      spawn `node <cli.js>`; this works for npm/scoop shims (pi.cmd)
  *      that Node's spawn cannot execute directly on Windows.
  */
-function resolvePiTarget(piPath?: string): ResolvedTarget {
+export function resolvePiTarget(piPath?: string): ResolvedTarget {
   const explicit = piPath ?? process.env.PI_PATH;
   if (explicit) {
     // If PI_PATH points directly at the CLI JS entry, run it via node

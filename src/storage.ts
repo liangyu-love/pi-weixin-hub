@@ -201,6 +201,29 @@ export function saveUserSession(
   saveSessionMap(accountId, map);
 }
 
+/**
+ * Remove session-map entries whose file is missing or older than cutoffMs.
+ * Returns the number of entries removed.
+ */
+export function pruneSessionMap(accountId: string, cutoffMs: number): number {
+  const map = loadSessionMap(accountId);
+  let removed = 0;
+  for (const key of Object.keys(map)) {
+    const filePath = map[key];
+    try {
+      if (!fs.existsSync(filePath) || fs.statSync(filePath).mtimeMs < cutoffMs) {
+        delete map[key];
+        removed++;
+      }
+    } catch {
+      delete map[key];
+      removed++;
+    }
+  }
+  if (removed > 0) saveSessionMap(accountId, map);
+  return removed;
+}
+
 // ── Context Token Storage (per-account, per-user) ──────────────────────
 
 const CTX_TOKEN_DIR = "context-tokens";
