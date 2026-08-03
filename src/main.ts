@@ -40,7 +40,8 @@ import { startWebhookServer, type WebhookServer } from "./webhook.js";
 import { Logger, resolveLogLevel } from "./logger.js";
 import { formatAndSplit } from "./format-reply.js";
 import { classifyError, formatClassifiedError } from "./error-classifier.js";
-import type { WeixinAccount, ImageItem, FileItem, VoiceItem, VideoItem } from "./types.js";
+import { buildContextPrefix, enrichMessageText, memoryFilePath, readMemoryFile } from "./context.js";
+import type { WeixinAccount, WeixinMessage, ImageItem, FileItem, VoiceItem, VideoItem } from "./types.js";
 import { MessageItemType, MessageType, MessageState } from "./types.js";
 import type { AgentEndEvent, ExtensionUIRequestEvent, ImageContent } from "./types-rpc.js";
 import { downloadImageForWeixin, saveFileLocally, saveVoiceLocally, saveVideoLocally, setMediaLogLevel } from "./media-handler.js";
@@ -280,6 +281,7 @@ async function runDaemon(): Promise<void> {
         log(`[rpc] 为 (${label}) 创建新会话`);
       }
       sessionOwnerKey = sessionKey;
+      needsCompact = false; // the compact flag belongs to the previous session
     } catch (err) {
       logWarn(`[rpc] 切换会话失败 (${label}): ${err instanceof Error ? err.message : String(err)}`);
       // Claim ownership optimistically so the turn proceeds; the session
@@ -856,6 +858,17 @@ async function runDaemon(): Promise<void> {
           break;
         }
 
+        case "memory": {
+          const memPath = memoryFilePath();
+          const content = readMemoryFile() ?? "";
+          const text = content
+            ? `📝 当前长期记忆：\n\n${content}\n\n（如需修改，可直接告诉 Pi 更新此文件）`
+            : "📝 暂无长期记忆。\n\n告诉我你想记住的事情，我会写进 memory.md；或直接编辑该文件。";
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, text);
+          log(`[slash] /memory (user=${userId})`);
+          break;
+        }
+
         case "status": {
           const [state, stats] = await Promise.all([
             rpcClient.getState(),
@@ -1004,6 +1017,7 @@ async function runDaemon(): Promise<void> {
             "/fork — 从历史消息 fork",
             "/last — 最后一条 assistant 回复",
             "/name <name> — 设置 session 名称",
+            "/memory — 查看长期记忆",
             "/help — 显示此帮助",
             "",
             "Pi 扩展命令也可以直接发送，如 /skill:xxx",
@@ -1384,7 +1398,7 @@ async function runDaemon(): Promise<void> {
         logDebug(`[weixin] 用户 ${userId} 的消息在 UI 等待期间被排队`);
         messageQueue.push({
           account, userId, contextToken: latestToken, sessionId, sessionKey,
-          text, imageItem, fileItem, voiceItem, videoItem,
+          text: enrichMessageText(msg, text), imageItem, fileItem, voiceItem, videoItem,
         });
         return;
       }
@@ -1408,6 +1422,9 @@ async function runDaemon(): Promise<void> {
       return;
     }
 
+    // ── Enrich message text (group attribution, quoted message) ───────
+    const enrichedText = enrichMessageText(msg, text);
+
     // ── Normal message: inject or queue ────────────────────────────────
     if (!processingWeixin && !rpcClient.isStreaming) {
       // Pi is idle — inject immediately
@@ -1417,7 +1434,7 @@ async function runDaemon(): Promise<void> {
         contextToken: latestToken,
         sessionId,
         sessionKey,
-        text,
+        text: enrichedText,
         imageItem,
         fileItem,
         voiceItem,
@@ -1432,7 +1449,7 @@ async function runDaemon(): Promise<void> {
         contextToken: latestToken,
         sessionId,
         sessionKey,
-        text,
+        text: enrichedText,
         imageItem,
         fileItem,
         voiceItem,
@@ -1466,6 +1483,9 @@ async function runDaemon(): Promise<void> {
     } catch (err) {
       logWarn(`[weixin] 会话切换异常: ${err instanceof Error ? err.message : String(err)}`);
     }
+
+    // ── Auto-compact if the previous turn left the context near full ──
+    await compactIfNeeded();
 
     let messageText = qm.text;
     let imagePath: string | null = null;
@@ -1615,6 +1635,12 @@ async function runDaemon(): Promise<void> {
       log(`[weixin] 图片已附加到 prompt (${imageContent.mimeType})`);
     }
 
+    // ── Prepend persona / memory context ─────────────────────────────
+    const ctxPrefix = buildContextPrefixForConfig();
+    if (ctxPrefix) {
+      messageText = ctxPrefix + messageText;
+    }
+
     const summary = messageText.slice(0, 60) || "[空消息]";
     const fileInfo = qm.fileItem ? ` + 文件: ${qm.fileItem.file_name ?? "unknown"}` : "";
     log(`[weixin] 发送 prompt: ${summary}${messageText.length > 60 ? "..." : ""}${imagePath ? ` + 图片: ${imagePath}` : ""}${voicePath ? ` + 语音: ${voicePath}` : ""}${videoPath ? ` + 视频: ${videoPath}` : ""}${fileInfo}`);
@@ -1754,6 +1780,48 @@ async function runDaemon(): Promise<void> {
     }
   }
 
+  // ── Persona / memory injection (C2) ──────────────────────────────────
+
+  /** Build the system-context prefix (persona + memory file) for a prompt. */
+  function buildContextPrefixForConfig(): string {
+    return buildContextPrefix(config.persona);
+  }
+
+  // ── Auto-compact before long turns (C3) ──────────────────────────────
+
+  /** Whether the next idle turn should compact first (set by stats check). */
+  let needsCompact = false;
+
+  /** Check context usage; flag the next turn for auto-compact if near full. */
+  async function checkContextUsage(): Promise<void> {
+    const threshold = config.autoCompactThreshold ?? 0;
+    if (threshold <= 0 || !rpcClient) return;
+    try {
+      const stats = (await rpcClient.getSessionStats()) as {
+        contextUsage?: { percent?: number | null } | null;
+      } | null;
+      const percent = stats?.contextUsage?.percent;
+      if (typeof percent === "number" && percent >= threshold) {
+        needsCompact = true;
+        log(`[rpc] 上下文使用率 ${percent.toFixed(1)}% ≥ ${threshold}%，下轮自动压缩`);
+      }
+    } catch {
+      /* best effort */
+    }
+  }
+
+  /** Compact once if flagged (idle-only; clears the flag either way). */
+  async function compactIfNeeded(): Promise<void> {
+    if (!needsCompact || !rpcClient) return;
+    needsCompact = false;
+    try {
+      await rpcClient.compact();
+      log("[rpc] 已自动压缩上下文");
+    } catch (err) {
+      logWarn(`[rpc] 自动压缩失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // ── RPC Event Binding ────────────────────────────────────────────────
 
   /**
@@ -1823,6 +1891,10 @@ async function runDaemon(): Promise<void> {
 
       // ── Persist the session file path (per-user map, for resume) ──
       await persistCurrentSession(ctx.account.id, ctx.sessionKey);
+
+      // ── Check context usage for the next-turn auto-compact decision ──
+      void checkContextUsage();
+
       processingWeixin = false;
     } else if (reply) {
       // Got a reply but no pending context — Pi retried after we cleared context

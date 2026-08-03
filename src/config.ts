@@ -29,6 +29,10 @@ export interface WeixinConfig {
   blocklist?: string[];
   /** 每用户每分钟最大消息数（0 = 不限）。 */
   rateLimitMax?: number;
+  /** 人设：注入到每条 prompt 的系统信息（空 = 不注入）。 */
+  persona?: string;
+  /** 上下文使用率达到该百分比时自动压缩（0 = 禁用）。 */
+  autoCompactThreshold?: number;
   /** 本地 webhook 端口（0 = 禁用）；供 Pi 扩展/脚本主动推送消息。 */
   webhookPort?: number;
   /** webhook 访问令牌（空则 daemon 启动时自动生成）。 */
@@ -61,6 +65,8 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   allowlist: [],
   blocklist: [],
   rateLimitMax: 0,
+  persona: "",
+  autoCompactThreshold: 80,
   webhookPort: 0,
   webhookToken: "",
   groupChat: false,
@@ -147,6 +153,17 @@ export function setConfigValue(
       return null;
     }
 
+    case "persona":
+      config.persona = rawValue;
+      return null;
+
+    case "autoCompactThreshold": {
+      const n = parseInt(rawValue, 10);
+      if (isNaN(n) || n < 0 || n > 100) return `autoCompactThreshold 必须是 0-100 的数字（0=禁用）`;
+      config.autoCompactThreshold = n;
+      return null;
+    }
+
     case "webhookPort": {
       const n = parseInt(rawValue, 10);
       if (isNaN(n) || n < 0 || n > 65535) return `webhookPort 必须是 0-65535 的数字（0=禁用）`;
@@ -225,6 +242,8 @@ export function describeConfig(config: WeixinConfig): string {
       : "(无)",
   );
   label("rateLimitMax", config.rateLimitMax && config.rateLimitMax > 0 ? `${config.rateLimitMax} 条/分钟` : "(不限)");
+  label("persona", config.persona ? config.persona : "(无)");
+  label("autoCompactThreshold", config.autoCompactThreshold && config.autoCompactThreshold > 0 ? `${config.autoCompactThreshold}%` : "(禁用)");
   label("webhookPort", config.webhookPort && config.webhookPort > 0 ? `127.0.0.1:${config.webhookPort}` : "(禁用)");
   label("webhookToken", config.webhookToken ? `${config.webhookToken.slice(0, 6)}...` : "(自动生成)");
   label("groupChat", config.groupChat ? "启用" : "禁用（忽略群消息）");

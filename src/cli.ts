@@ -48,6 +48,8 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   rateLimitMax       每用户每分钟消息上限 (0=不限)
   webhookPort        webhook 端口 (0=禁用；供 Pi 扩展/脚本主动推送)
   webhookToken       webhook 访问令牌（空=daemon 启动时自动生成）
+  persona            人设（注入到每条 prompt 的系统信息）
+  autoCompactThreshold  上下文使用率自动压缩阈值 (0-100, 0=禁用)
   groupChat          群聊模式 (true/false)
   botName            群聊 @ 触发昵称 (如 "mybot"，空=处理所有群消息)
   maxReplyLength     单条回复最大字符数 (0=不拆分)

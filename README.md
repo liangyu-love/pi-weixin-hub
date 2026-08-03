@@ -315,6 +315,8 @@ pi-weixin-cli 支持接收微信视频消息：
 | `rateLimitMax` | number | `0` | 每用户每分钟最大消息数（`0` = 不限） |
 | `webhookPort` | number | `0` | 本地 webhook 端口（`0` = 禁用）；供 Pi 扩展/脚本主动推送 |
 | `webhookToken` | string | `""` | webhook 访问令牌（空 = daemon 启动时自动生成） |
+| `persona` | string | `""` | 人设：注入到每条 prompt 的系统信息 |
+| `autoCompactThreshold` | number | `80` | 上下文使用率 ≥ 该百分比时自动压缩（`0` = 禁用） |
 | `groupChat` | boolean | `false` | 是否响应群聊消息 |
 | `botName` | string | `""` | 群聊触发昵称（消息需含 `@botName`；空 = 处理所有群消息） |
 | `maxReplyLength` | number | `2000` | 单条回复最大字符数，超过自动拆分（`0` = 不拆分） |
@@ -390,6 +392,13 @@ cp extension/pi-weixin-hub.ts ~/.pi/agent/extensions/
 - **工具**：`weixin_send({text, user?})`、`weixin_media({url, type?, caption?, user?})` 按 pi 扩展工具 API 注册
 
 > 注意：webhook 仅绑定回环地址；令牌由 daemon 自动生成。若不需要，将 `webhookPort` 设为 `0`。
+
+## 上下文与记忆（Phase C）
+
+- **消息增强**：群聊消息自动附加 `[群聊消息 · 发送者ID: xxx]`；引用消息（回复他人时）附加 `[引用消息] 原文`，让 Pi 准确理解语境
+- **人设**：`config set persona "你是我的微信私人助理"`，每条 prompt 自动注入
+- **长期记忆**：编辑 `~/.config/pi-weixin-cli/memory.md`（或直接告诉 Pi 更新它），内容会随每条 prompt 注入；`/memory` 命令可查看
+- **自动压缩**：上下文使用率 ≥ `autoCompactThreshold`（默认 80%）时，下一条消息前自动 `/compact`，避免长对话触发上下文溢出
 
 ## 状态面板（Step 12）
 
