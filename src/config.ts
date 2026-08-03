@@ -43,6 +43,8 @@ export interface WeixinConfig {
   persistentSession?: boolean;
   /** 图片分析：自动检测模型视觉能力（视觉模型直接附加，文本模型走 vision 子代理）。 */
   visionAgent?: boolean;
+  /** 输入法正在输入提示（agent 运行时显示“正在输入”）。 */
+  typingIndicator?: boolean;
   /** vision 子代理名称。默认 "vision"。 */
   visionSubagent?: string;
   /** 强制将图片以 base64 直接附加到 prompt（覆盖自动检测）。默认 false。 */
@@ -62,6 +64,7 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   logLevel: "info",
   persistentSession: true,
   visionAgent: true,
+  typingIndicator: true,
   visionSubagent: "vision",
   attachImages: false,
 };
@@ -147,6 +150,11 @@ export function setConfigValue(
       return null;
     }
 
+    case "typingIndicator": {
+      config.typingIndicator = rawValue === "true" || rawValue === "1" || rawValue === "yes";
+      return null;
+    }
+
     case "botName":
       config.botName = rawValue.trim();
       return null;
@@ -207,6 +215,7 @@ export function describeConfig(config: WeixinConfig): string {
   label("logLevel", config.logLevel ?? "info");
   label("persistentSession", config.persistentSession ? "启用" : "禁用");
   label("visionAgent", config.visionAgent ? "启用" : "禁用");
+  label("typingIndicator", config.typingIndicator ? "启用" : "禁用");
   label("visionSubagent", config.visionSubagent ?? "vision");
   label("attachImages", config.attachImages ? "启用" : "禁用（走 vision 子代理）");
   return lines.join("\n");

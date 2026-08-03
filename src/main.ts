@@ -398,6 +398,11 @@ async function runDaemon(): Promise<void> {
   /** Context of the currently processing WeChat message. */
   let pendingContext: PendingContext | null = null;
 
+  /** Data of the in-flight agent run (updated on each agent_end). */
+  let turnData: { messages: unknown[] | undefined; aborted: boolean } | null = null;
+  /** Backstop timer if agent_settled never arrives after a retrying run. */
+  let turnWatchdog: ReturnType<typeof setTimeout> | null = null;
+
   /** Pending model selections: userId → models array (for /model flow). */
   const pendingModelSelections = new Map<string, unknown[]>();
 
@@ -879,6 +884,35 @@ async function runDaemon(): Promise<void> {
           break;
         }
 
+        case "send-image": {
+          const url = cmd.args.trim();
+          if (!url) {
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, "⚠️ 用法: /send-image <图片URL>");
+            return;
+          }
+          await sendWeixinMedia(account, userId, contextToken, sessionId, { type: "image", url });
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, "🖼️ 图片已发送");
+          log(`[slash] /send-image ${url.slice(0, 60)} (user=${userId})`);
+          break;
+        }
+
+        case "send-file": {
+          const url = cmd.args.trim();
+          if (!url) {
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, "⚠️ 用法: /send-file <文件URL> [文件名]");
+            return;
+          }
+          const [urlPart, ...nameParts] = url.split(/\s+/);
+          await sendWeixinMedia(account, userId, contextToken, sessionId, {
+            type: "file",
+            url: urlPart,
+            caption: nameParts.join(" ") || undefined,
+          });
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, "📄 文件已发送");
+          log(`[slash] /send-file ${urlPart.slice(0, 60)} (user=${userId})`);
+          break;
+        }
+
         case "search": {
           const query = cmd.args.trim();
           if (!query) {
@@ -949,6 +983,8 @@ async function runDaemon(): Promise<void> {
             "/model [name] — 切换模型（带参数直接切换，无参数列出）",
             "/cycle-model — 轮播模型",
             "/image <url> — 分析一张网络图片",
+            "/send-image <url> — 直接发送一张图片到微信",
+            "/send-file <url> [name] — 发送一个文件到微信",
             "/search <query> — 联网搜索并总结",
             "/thinking [level] — 设置/切换 thinking level",
             "/steer-mode <mode> — 设置 steering 模式",
@@ -1589,7 +1625,201 @@ async function runDaemon(): Promise<void> {
     });
   }
 
+  // ── Typing indicator ─────────────────────────────────────────────────
+  /** Cached typing tickets: `${accountId}:${userId}` → ticket. */
+  const typingTickets = new Map<string, string>();
+
+  async function getTypingTicket(
+    account: WeixinAccount,
+    userId: string,
+    contextToken: string,
+  ): Promise<string | null> {
+    const key = `${account.id}:${userId}`;
+    const cached = typingTickets.get(key);
+    if (cached) return cached;
+    try {
+      const resp = await api.getConfig(userId, account.botToken, contextToken, account.baseUrl);
+      if (resp.typing_ticket) {
+        typingTickets.set(key, resp.typing_ticket);
+        return resp.typing_ticket;
+      }
+    } catch (err) {
+      logDebug(`[weixin] 获取 typing ticket 失败 (${userId}): ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return null;
+  }
+
+  /** Fire-and-forget typing status to a user. */
+  function sendTypingStatus(
+    account: WeixinAccount,
+    userId: string,
+    contextToken: string,
+    status: 1 | 2,
+  ): void {
+    if (!config.typingIndicator) return;
+    void getTypingTicket(account, userId, contextToken)
+      .then((ticket) => {
+        if (!ticket) return;
+        return api
+          .sendTyping(userId, ticket, status, account.botToken, account.baseUrl)
+          .catch((err) => {
+            logDebug(`[weixin] typing 状态发送失败: ${err instanceof Error ? err.message : String(err)}`);
+          });
+      });
+  }
+
+  // ── Media outbox (Pi writes manifests; daemon sends them as attachments) ──
+  const OUTBOX_DIR = path.join(os.homedir(), ".config", "pi-weixin-cli", "outbox");
+
+  interface OutboxManifest {
+    type?: string;
+    url?: string;
+    caption?: string;
+  }
+
+  /** Scan and remove outbox manifests; returns the media items to send. */
+  function drainOutbox(): OutboxManifest[] {
+    const items: OutboxManifest[] = [];
+    try {
+      if (!fs.existsSync(OUTBOX_DIR)) return items;
+      for (const file of fs.readdirSync(OUTBOX_DIR)) {
+        if (!file.endsWith(".json")) continue;
+        const filePath = path.join(OUTBOX_DIR, file);
+        try {
+          const manifest = JSON.parse(fs.readFileSync(filePath, "utf-8")) as OutboxManifest;
+          if (manifest && typeof manifest.url === "string" && manifest.url) {
+            items.push(manifest);
+          }
+        } catch {
+          logWarn(`[weixin] outbox 清单解析失败: ${file}`);
+        }
+        try {
+          fs.unlinkSync(filePath);
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch (err) {
+      logWarn(`[weixin] 扫描 outbox 失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return items;
+  }
+
+  /** Send a URL-based media item to a WeChat user. */
+  async function sendWeixinMedia(
+    account: WeixinAccount,
+    toUserId: string,
+    contextToken: string,
+    sessionId: string,
+    manifest: OutboxManifest,
+  ): Promise<void> {
+    const isFile = manifest.type === "file";
+    const item = isFile
+      ? { type: MessageItemType.FILE, file_item: { media: { full_url: manifest.url }, file_name: manifest.caption ?? "file" } }
+      : { type: MessageItemType.IMAGE, image_item: { url: manifest.url } };
+    try {
+      await api.sendMessage(
+        {
+          msg: {
+            from_user_id: "",
+            client_id: crypto.randomUUID(),
+            to_user_id: toUserId,
+            message_type: MessageType.BOT,
+            message_state: MessageState.FINISH,
+            create_time_ms: Date.now(),
+            item_list: [item] as never[],
+            context_token: contextToken,
+            session_id: sessionId || undefined,
+          },
+        },
+        account.botToken,
+        account.baseUrl,
+      );
+      log(`[weixin] 媒体消息已发送 (${isFile ? "file" : "image"}): ${(manifest.url ?? "").slice(0, 80)}`);
+    } catch (err) {
+      logWarn(`[weixin] 媒体消息发送失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // ── RPC Event Binding ────────────────────────────────────────────────
+
+  /**
+   * Finalize the current WeChat-triggered turn: send the reply, release the
+   * typing indicator, drain the media outbox, persist the session, and
+   * resume queue processing. Idempotent (no-op when no turn is pending).
+   */
+  async function finalizeTurn(): Promise<void> {
+    if (!turnData) return;
+    const { messages, aborted } = turnData;
+    turnData = null;
+    if (turnWatchdog) {
+      clearTimeout(turnWatchdog);
+      turnWatchdog = null;
+    }
+
+    const reply = extractAssistantReply(messages);
+    const hasPending = pendingContext !== null;
+    lastActivityAt = Date.now();
+
+    // Deliver buffered notifications before the turn's context is cleared
+    // (prevents them leaking into the next user's turn).
+    flushUiNotifications();
+
+    log(`[rpc] finalize turn | aborted=${aborted} hasPending=${hasPending} hasReply=${!!reply}`);
+
+    if (hasPending && pendingContext) {
+      const ctx = pendingContext;
+      pendingContext = null;
+
+      // Release the typing indicator first
+      sendTypingStatus(ctx.account, ctx.userId, ctx.contextToken, 2);
+
+      if (aborted) {
+        // Intentional abort (user /abort or Pi aborted) — no error prompt
+        await sendWeixinReply(
+          api, ctx.account, ctx.userId, ctx.contextToken, ctx.sessionId,
+          "⏹️ 已中止当前任务",
+        ).catch(() => {});
+      } else if (reply) {
+        // ── Format + split long replies, apply status prefix ────────
+        const chunks = formatAndSplit(reply, config.maxReplyLength ?? 2000);
+        const prefix = config.replyPrefix ?? "";
+        for (const chunk of chunks) {
+          await sendWeixinReply(
+            api, ctx.account, ctx.userId, ctx.contextToken, ctx.sessionId,
+            `${prefix}${chunk}`,
+          );
+        }
+
+        // ── Media outbox: Pi-written manifests are sent as attachments ──
+        const outboxItems = drainOutbox();
+        for (const item of outboxItems) {
+          await sendWeixinMedia(ctx.account, ctx.userId, ctx.contextToken, ctx.sessionId, item);
+        }
+      } else {
+        log("[weixin] 未找到 assistant 文本回复");
+        // Notify user with a classified error prompt when possible
+        const msg = lastAgentError
+          ? formatClassifiedError(lastAgentError)
+          : "⚠️ Pi 未生成回复。可能是当前模型不支持此输入（如图片），或处理异常。可发送 /model 切换模型。";
+        await sendWeixinReply(
+          api, ctx.account, ctx.userId, ctx.contextToken, ctx.sessionId,
+          msg,
+        ).catch(() => {});
+      }
+
+      // ── Persist the session file path (per-user map, for resume) ──
+      await persistCurrentSession(ctx.account.id, ctx.sessionKey);
+      processingWeixin = false;
+    } else if (reply) {
+      // Got a reply but no pending context — Pi retried after we cleared context
+      log(`[weixin] 发现延迟回复但 pendingContext 已清空: ${reply.slice(0, 60)}...`);
+    }
+
+    // Transition to idle + process next queued message
+    sm.setIdle();
+    flushQueue();
+  }
 
   /**
    * Bind all RPC event handlers to a (new) RpcClient instance.
@@ -1600,75 +1830,39 @@ async function runDaemon(): Promise<void> {
       log("[rpc] agent_start");
       lastAgentError = null;
       sm.setAgentRunning();
+      // Show the typing indicator while Pi works
+      if (pendingContext) {
+        sendTypingStatus(pendingContext.account, pendingContext.userId, pendingContext.contextToken, 1);
+      }
     });
 
-    client.on("agent_end", async (event: AgentEndEvent) => {
-      const aborted = event.aborted ?? false;
-      const reply = extractAssistantReply(event.messages);
-      const hasPending = pendingContext !== null;
+    client.on("agent_end", (event: AgentEndEvent) => {
+      const willRetry = event.willRetry ?? false;
+      turnData = { messages: event.messages, aborted: event.aborted ?? false };
       lastActivityAt = Date.now();
 
-      // Deliver any buffered notifications before the turn's context is
-      // cleared (prevents them leaking into the next user's turn).
-      flushUiNotifications();
-
-      log(`[rpc] agent_end | aborted=${aborted} hasPending=${hasPending} hasReply=${!!reply}`);
-
-      // If we were processing a WeChat message, send the reply back
-      if (hasPending && pendingContext) {
-        const ctx = pendingContext;
-        pendingContext = null;
-
-        if (aborted) {
-          // Intentional abort (user /abort or Pi aborted) — no error prompt
-          await sendWeixinReply(
-            api, ctx.account, ctx.userId, ctx.contextToken, ctx.sessionId,
-            "⏹️ 已中止当前任务",
-          ).catch(() => {});
-        } else if (reply) {
-          // ── Format + split long replies, apply status prefix ────────
-          const chunks = formatAndSplit(reply, config.maxReplyLength ?? 2000);
-          const prefix = config.replyPrefix ?? "";
-          for (const chunk of chunks) {
-            await sendWeixinReply(
-              api,
-              ctx.account,
-              ctx.userId,
-              ctx.contextToken,
-              ctx.sessionId,
-              `${prefix}${chunk}`,
-            );
-          }
-        } else {
-          log("[weixin] agent_end 中未找到 assistant 文本回复");
-          // Notify user with a classified error prompt when possible
-          const msg = lastAgentError
-            ? formatClassifiedError(lastAgentError)
-            : "⚠️ Pi 未生成回复。可能是当前模型不支持此输入（如图片），或处理异常。可发送 /model 切换模型。";
-          await sendWeixinReply(
-            api,
-            ctx.account,
-            ctx.userId,
-            ctx.contextToken,
-            ctx.sessionId,
-            msg,
-          ).catch(() => {});
-        }
-
-        // ── Persist the session file path (per-user map, for resume) ──
-        await persistCurrentSession(ctx.account.id, ctx.sessionKey);
-
-        processingWeixin = false;
-      } else if (reply) {
-        // Got a reply but no pending context — Pi retried after we cleared context
-        log(`[weixin] 发现延迟回复但 pendingContext 已清空: ${reply.slice(0, 60)}...`);
+      if (willRetry) {
+        // An automatic retry follows — hold the turn instead of replying
+        // prematurely with an error. Finalize on the retried run's
+        // agent_end or on agent_settled (with a watchdog backstop).
+        log(`[rpc] agent_end (willRetry=true) — 等待重试...`);
+        if (turnWatchdog) clearTimeout(turnWatchdog);
+        turnWatchdog = setTimeout(() => {
+          logWarn(`[rpc] agent_settled 未在超时内到达，强制结束回合`);
+          void finalizeTurn();
+        }, 120_000);
+        return;
       }
 
-      // Transition to idle
-      sm.setIdle();
+      void finalizeTurn();
+    });
 
-      // Process next queued message
-      flushQueue();
+    client.on("agent_settled", () => {
+      log("[rpc] agent_settled");
+      // Finalize any still-pending turn (retries, queued continuations).
+      if (turnData) {
+        void finalizeTurn();
+      }
     });
 
     client.on("message_update", () => {
@@ -1775,6 +1969,14 @@ async function runDaemon(): Promise<void> {
         const errText = event.error ?? "unknown";
         lastAgentError = errText;
         logWarn(`[rpc] response error: ${event.command} → ${errText} (${classifyError(errText).category})`);
+
+        // A rejected prompt/steer produces no agent events — finalize the
+        // pending turn so the user gets the classified error instead of
+        // waiting forever.
+        if ((event.command === "prompt" || event.command === "steer") && pendingContext && !turnData) {
+          turnData = { messages: [], aborted: false };
+          void finalizeTurn();
+        }
       }
     });
 
@@ -1819,6 +2021,11 @@ async function runDaemon(): Promise<void> {
     messageQueue.length = 0;
     pendingContext = null;
     processingWeixin = false;
+    turnData = null;
+    if (turnWatchdog) {
+      clearTimeout(turnWatchdog);
+      turnWatchdog = null;
+    }
 
     // ── Exponential backoff retry loop ────────────────────────────────
     const maxRetries = 10;

@@ -126,6 +126,12 @@ export interface AgentEndEvent {
   messages?: unknown[];
   /** Whether the turn was aborted. */
   aborted?: boolean;
+  /** Whether an automatic retry will follow this low-level run. */
+  willRetry?: boolean;
+}
+
+export interface AgentSettledEvent {
+  type: "agent_settled";
 }
 
 export interface MessageUpdateEvent {
@@ -182,6 +188,7 @@ export interface ResponseEvent {
 export type RpcStdoutEvent =
   | AgentStartEvent
   | AgentEndEvent
+  | AgentSettledEvent
   | MessageUpdateEvent
   | ExtensionUIRequestEvent
   | ToolExecutionStartEvent

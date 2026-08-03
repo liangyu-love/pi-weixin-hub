@@ -21,6 +21,7 @@ import type {
   RpcStdoutEvent,
   AgentStartEvent,
   AgentEndEvent,
+  AgentSettledEvent,
   MessageUpdateEvent,
   ExtensionUIRequestEvent,
   ToolExecutionStartEvent,
@@ -146,6 +147,7 @@ export interface RpcSpawnOptions {
 export interface RpcClientEvents {
   agent_start: [event: AgentStartEvent];
   agent_end: [event: AgentEndEvent];
+  agent_settled: [event: AgentSettledEvent];
   message_update: [event: MessageUpdateEvent];
   extension_ui_request: [event: ExtensionUIRequestEvent];
   tool_execution_start: [event: ToolExecutionStartEvent];
@@ -588,6 +590,10 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
       case "agent_end":
         this._isStreaming = false;
         this.emit("agent_end", event as AgentEndEvent);
+        break;
+
+      case "agent_settled":
+        this.emit("agent_settled", event as AgentSettledEvent);
         break;
 
       case "message_update":

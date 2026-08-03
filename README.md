@@ -154,6 +154,8 @@ Weixin Backend (ilinkai.weixin.qq.com)
 | `/model [name]` | 切换模型：带参数直接按名称/ID 切换，无参数列出可选模型 |
 | `/cycle-model` | 轮播到下一个可用模型 |
 | `/image <url>` | 分析一张网络图片（自动走视觉模型或 vision 子代理） |
+| `/send-image <url>` | 直接把一张网络图片发送到微信 |
+| `/send-file <url> [name]` | 把一个网络文件发送到微信 |
 | `/search <query>` | 联网搜索并总结（要求模型使用搜索工具/技能） |
 | `/status` | 查看会话状态 + 队列与当前会话信息 |
 | `/thinking [level]` | 设置（off/minimal/low/medium/high/xhigh）或轮播 thinking level |
@@ -318,6 +320,7 @@ pi-weixin-cli 支持接收微信视频消息：
 | `logLevel` | string | `"info"` | 日志级别：`debug` / `info` / `warn` / `error` |
 | `persistentSession` | boolean | `true` | 重启 daemon 后自动恢复上次的会话上下文 |
 | `visionAgent` | boolean | `true` | 图片分析开关：自动检测模型能力，视觉模型直接附加、文本模型走 vision 子代理 |
+| `typingIndicator` | boolean | `true` | Pi 处理消息时在微信显示「正在输入」 |
 | `visionSubagent` | string | `"vision"` | vision 子代理名称 |
 | `attachImages` | boolean | `false` | 强制以 base64 直接附加图片（覆盖自动检测） |
 
@@ -331,6 +334,20 @@ pi-weixin-cli 支持接收微信视频消息：
 - **黑名单**：`blocklist` 中的用户消息被静默忽略（白名单优先检查，随后黑名单）。
 - **通知合并**：Pi 的连续 `notify` / `setStatus` 等 fire-and-forget 通知会在 1.5 秒内合并为
   一条微信消息发送，避免刷屏；对话请求（select/confirm/input）会先刷新缓冲的通知再提问。
+
+## 媒体输出（Media Outbox）
+
+Pi 可以在回合中把图片/文件**主动发送**给用户：把 JSON 清单写入 outbox 目录，daemon 在回合结束时自动发送并清空：
+
+```json
+// ~/.config/pi-weixin-cli/outbox/send.json
+{ "type": "image", "url": "https://example.com/pic.png", "caption": "可选说明" }
+{ "type": "file", "url": "https://example.com/report.pdf", "caption": "report.pdf" }
+```
+
+- `type`: `image`（默认）或 `file`
+- `url`: 用户可访问的网络地址（当前 iLink API 仅支持 URL 媒体，本地文件上传待验证）
+- 也可直接使用微信内命令 `/send-image <url>` 或 `/send-file <url> [name]`
 
 ## 状态面板（Step 12）
 

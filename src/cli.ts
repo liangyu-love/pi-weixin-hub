@@ -53,6 +53,7 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   logLevel           日志级别 (debug/info/warn/error)
   persistentSession  重启后恢复上下文 (true/false)
   visionAgent        图片分析（自动检测模型能力，默认开启） (true/false)
+  typingIndicator    Pi 处理时显示“正在输入” (true/false)
   visionSubagent     vision 子代理名称 (默认 vision)
   attachImages       强制 base64 直接附加图片（覆盖自动检测） (true/false)
 `;
