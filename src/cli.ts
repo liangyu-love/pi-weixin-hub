@@ -62,6 +62,7 @@ const HELP = `pi-weixin-hub — 微信消息桥接工具（pi-weixin-cli 的分�
   userModels        每用户模型映射 JSON，如 {"uid":"provider/model"}
   requireApproval   讨论优先：禁止自主执行工具/改文件，需用户同意 (true/false)
   schedules         定时任务 JSON，如 {"8:00":"早安","every:30":"push:提醒"}（push:前缀=直接推送）
+  workspaces        微信工作区别名 JSON，如 {"pi":"C:/work/pi","hub":"D:/work/hub"}
   --fork            后台启动 daemon（分离进程 + PID 文件）
   groupChat          群聊模式 (true/false)
   botName            群聊 @ 触发昵称 (如 "mybot"，空=处理所有群消息)
@@ -254,6 +255,8 @@ function formatDaemonStatus(): string {
       `  运行时长:     ${fmtUptime((st.uptimeSec as number) ?? 0)}`,
       `  账号:         ${((st.accounts as string[]) ?? []).join(", ") || "(无)"}`,
       `  当前会话:     ${(st.sessionOwner as string) ?? "(无)"}`,
+      `  当前工作区:   ${(st.workspace as string) ?? "(未知)"}`,
+      `  工作目录:     ${(st.workspaceCwd as string) ?? "(未知)"}`,
       `  待处理队列:   ${(st.queueLength as number) ?? 0} 条`,
       `  Pi 进程:      ${st.piRunning ? "运行中" : "未运行"}`,
     ];

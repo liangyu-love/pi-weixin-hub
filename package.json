@@ -26,7 +26,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "postbuild": "chmod +x dist/main.js",
+    "postbuild": "node -e \"if(process.platform!=='win32')require('node:fs').chmodSync('dist/main.js',0o755)\"",
     "prepack": "npm run build",
     "start": "node dist/main.js",
     "check": "tsc && node dist/selfcheck.js"

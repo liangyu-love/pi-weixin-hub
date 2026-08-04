@@ -134,6 +134,7 @@ function deleteSyncState(accountId: string): void {
 
 const SESSION_MAP_FILE = "sessions.json";
 const LEGACY_SESSION_SUFFIX = "-last-session.json";
+const WORKSPACE_MAP_FILE = "workspaces.json";
 
 function sessionMapPath(accountId: string): string {
   return path.join(getStateDir(), `${safeId(accountId)}-${SESSION_MAP_FILE}`);
@@ -141,6 +142,10 @@ function sessionMapPath(accountId: string): string {
 
 function legacySessionPath(accountId: string): string {
   return path.join(getStateDir(), `${safeId(accountId)}${LEGACY_SESSION_SUFFIX}`);
+}
+
+function workspaceMapPath(accountId: string): string {
+  return path.join(getStateDir(), `${safeId(accountId)}-${WORKSPACE_MAP_FILE}`);
 }
 
 function saveSessionMap(accountId: string, map: Record<string, string>): void {
@@ -203,6 +208,36 @@ export function saveUserSession(
   const map = loadSessionMap(accountId);
   map[sessionKey] = sessionPath;
   saveSessionMap(accountId, map);
+}
+
+/** Load the selected workspace alias for one private/group conversation. */
+export function loadUserWorkspace(accountId: string, sessionKey: string): string | null {
+  try {
+    const filePath = workspaceMapPath(accountId);
+    if (!fs.existsSync(filePath)) return null;
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    if (!parsed || typeof parsed !== "object") return null;
+    const value = (parsed as Record<string, unknown>)[sessionKey];
+    return typeof value === "string" && value ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist the selected workspace alias for one private/group conversation. */
+export function saveUserWorkspace(accountId: string, sessionKey: string, alias: string): void {
+  let map: Record<string, string> = {};
+  const filePath = workspaceMapPath(accountId);
+  try {
+    if (fs.existsSync(filePath)) {
+      const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      if (parsed && typeof parsed === "object") map = parsed as Record<string, string>;
+    }
+  } catch {
+    map = {};
+  }
+  map[sessionKey] = alias;
+  writeJsonAtomic(filePath, map);
 }
 
 /**

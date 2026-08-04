@@ -35,7 +35,7 @@ import { fileURLToPath } from "node:url";
 import { WeixinApi } from "./api.js";
 import { Poller, type MessageCallback, type LogCallback } from "./poller.js";
 import { RpcClient, setRpcLogLevel } from "./rpc-client.js";
-import { loadAccounts, saveContextToken, loadContextTokens, loadUserSession, saveUserSession, pruneSessionMap, loadUsage, addUsage, totalAccountCost } from "./storage.js";
+import { loadAccounts, saveContextToken, loadContextTokens, loadUserSession, saveUserSession, loadUserWorkspace, saveUserWorkspace, pruneSessionMap, loadUsage, addUsage, totalAccountCost } from "./storage.js";
 import { loadConfig, saveConfig } from "./config.js";
 import { startWebhookServer, type WebhookServer } from "./webhook.js";
 import { Logger, resolveLogLevel, setLogFile } from "./logger.js";
@@ -50,6 +50,7 @@ import { convertDocumentToMarkdown, setDocConvertLogLevel } from "./document-con
 import { StateMachine, type UIMethod, type UIRequestContext } from "./state-machine.js";
 import { formatUIRequestForWeixin, isFireAndForget, parseUserResponse } from "./ui-bridge.js";
 import { runCLI } from "./cli.js";
+import { findWorkspaceAlias, isPathInside, resolveWorkspaceRegistry, workspaceSessionKey } from "./workspaces.js";
 
 // ── Pending Context (for reply routing) ────────────────────────────────
 
@@ -211,6 +212,8 @@ async function runDaemon(): Promise<void> {
   const config = loadConfig();
   // Pi session working directory: config.workDir overrides the daemon cwd
   const daemonCwd = config.workDir?.trim() || process.cwd();
+  const workspaceRegistry = resolveWorkspaceRegistry(config.workspaces, daemonCwd);
+  const defaultWorkspaceRoot = workspaceRegistry.roots.get(workspaceRegistry.defaultAlias)!;
   if (config.workDir) {
     log(`[workdir] Pi 工作目录: ${daemonCwd}`);
   }
@@ -227,6 +230,8 @@ async function runDaemon(): Promise<void> {
     setLogFile(config.logFile, config.logMaxBytes ?? 5 * 1024 * 1024);
     log(`[log] 日志文件: ${config.logFile} (轮转上限 ${((config.logMaxBytes ?? 5 * 1024 * 1024) / 1024 / 1024).toFixed(1)}MB)`);
   }
+  for (const warning of workspaceRegistry.warnings) logWarn(`[workspace] ${warning}`);
+  log(`[workspace] 默认工作区: ${workspaceRegistry.defaultAlias} → ${defaultWorkspaceRoot}`);
 
   // ── Respect config.enabled ───────────────────────────────────────────
   if (!config.enabled) {
@@ -363,12 +368,36 @@ async function runDaemon(): Promise<void> {
 
   // ── Multi-session routing state ──────────────────────────────────────
 
-  /**
-   * Session key of the session currently active in the shared RPC process.
-   * "" = default/private session; otherwise a from_user_id (group sender).
-   * Reset to null when the RPC process restarts (it holds a fresh session).
-   */
+  /** Route id of the session currently active in the shared RPC process. */
   let sessionOwnerKey: string | null = null;
+
+  function selectedWorkspaceAlias(accountId: string, sessionKey: string): string {
+    const saved = loadUserWorkspace(accountId, sessionKey);
+    return saved && workspaceRegistry.roots.has(saved) ? saved : workspaceRegistry.defaultAlias;
+  }
+
+  function routeId(accountId: string, sessionKey: string, alias: string): string {
+    return `${accountId}\u001f${sessionKey}\u001f${alias}`;
+  }
+
+  function loadWorkspaceSession(accountId: string, sessionKey: string, alias: string): string | null {
+    const mapped = loadUserSession(accountId, workspaceSessionKey(sessionKey, alias));
+    if (mapped) return mapped;
+    // Backward compatibility: the old map stored the default workspace under
+    // the bare private/group key.
+    return alias === workspaceRegistry.defaultAlias ? loadUserSession(accountId, sessionKey) : null;
+  }
+
+  function sessionBelongsToWorkspace(sessionPath: string, alias: string): boolean {
+    const root = workspaceRegistry.roots.get(alias);
+    const sessionCwd = getSessionCwd(sessionPath);
+    if (!root || !sessionCwd) return false;
+    try {
+      return isPathInside(root, fs.realpathSync(sessionCwd));
+    } catch {
+      return false;
+    }
+  }
 
   /**
    * Switch the shared RPC process to the session belonging to `sessionKey`
@@ -377,24 +406,26 @@ async function runDaemon(): Promise<void> {
    */
   async function ensureSessionFor(account: WeixinAccount, sessionKey: string): Promise<void> {
     if (!rpcClient) return;
-    if (sessionOwnerKey === sessionKey) return;
+    const alias = selectedWorkspaceAlias(account.id, sessionKey);
+    const owner = routeId(account.id, sessionKey, alias);
+    if (sessionOwnerKey === owner) return;
     const label = sessionKey === "" ? "默认" : sessionKey.slice(0, 12);
-    const saved = loadUserSession(account.id, sessionKey);
+    const root = workspaceRegistry.roots.get(alias)!;
+    const saved = loadWorkspaceSession(account.id, sessionKey, alias);
     try {
-      if (saved && fs.existsSync(saved)) {
+      if (saved && fs.existsSync(saved) && sessionBelongsToWorkspace(saved, alias)) {
         await rpcClient.switchSession(saved);
-        log(`[rpc] 会话已切换到 (${label}): ${saved}`);
+        activeRpcCwd = fs.realpathSync(getSessionCwd(saved)!);
+        log(`[rpc] 会话已切换到 (${label}/${alias}): ${saved}`);
       } else {
-        await rpcClient.newSession();
-        log(`[rpc] 为 (${label}) 创建新会话`);
+        await replaceRpcClient(root);
+        log(`[rpc] 为 (${label}/${alias}) 创建新会话: ${root}`);
       }
-      sessionOwnerKey = sessionKey;
+      sessionOwnerKey = owner;
       needsCompact = false; // the compact flag belongs to the previous session
     } catch (err) {
-      logWarn(`[rpc] 切换会话失败 (${label}): ${err instanceof Error ? err.message : String(err)}`);
-      // Claim ownership optimistically so the turn proceeds; the session
-      // path is re-saved on agent_end regardless.
-      sessionOwnerKey = sessionKey;
+      logWarn(`[rpc] 切换会话失败 (${label}/${alias}): ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   }
 
@@ -408,11 +439,41 @@ async function runDaemon(): Promise<void> {
     try {
       const state = (await rpcClient.getState()) as { sessionFile?: string } | null;
       if (state?.sessionFile) {
-        saveUserSession(accountId, sessionKey, state.sessionFile);
+        const alias = selectedWorkspaceAlias(accountId, sessionKey);
+        saveUserSession(accountId, workspaceSessionKey(sessionKey, alias), state.sessionFile);
       }
     } catch {
       /* best effort */
     }
+  }
+
+  async function activateWorkspace(
+    account: WeixinAccount,
+    sessionKey: string,
+    alias: string,
+    forceNew: boolean,
+  ): Promise<void> {
+    const root = workspaceRegistry.roots.get(alias);
+    if (!root) throw new Error(`未知工作区: ${alias}`);
+
+    const currentAlias = selectedWorkspaceAlias(account.id, sessionKey);
+    const currentOwner = routeId(account.id, sessionKey, currentAlias);
+    if (sessionOwnerKey !== currentOwner) {
+      await ensureSessionFor(account, sessionKey);
+    }
+    await persistCurrentSession(account.id, sessionKey);
+    const saved = forceNew ? null : loadWorkspaceSession(account.id, sessionKey, alias);
+    if (saved && fs.existsSync(saved) && sessionBelongsToWorkspace(saved, alias)) {
+      await rpcClient!.switchSession(saved);
+      activeRpcCwd = fs.realpathSync(getSessionCwd(saved)!);
+    } else {
+      await replaceRpcClient(root);
+    }
+
+    saveUserWorkspace(account.id, sessionKey, alias);
+    sessionOwnerKey = routeId(account.id, sessionKey, alias);
+    needsCompact = false;
+    await persistCurrentSession(account.id, sessionKey);
   }
 
   // ── Vision capability detection (adaptive image handling) ────────────
@@ -452,6 +513,8 @@ async function runDaemon(): Promise<void> {
   // ── Mutable state (may be reset during reconnect) ────────────────────
   let rpcClient: RpcClient | null = null;
   let shuttingDown = false;
+  let activeRpcCwd = defaultWorkspaceRoot;
+  const intentionallyStoppedClients = new WeakSet<RpcClient>();
 
   // ── Daemon status heartbeat (for the CLI dashboard) ──────────────────
   const daemonStartTime = Date.now();
@@ -486,6 +549,8 @@ async function runDaemon(): Promise<void> {
       version: pkgVersion,
       accounts: accounts.map((a) => a.id),
       sessionOwner: sessionOwnerKey ?? null,
+      workspace: findWorkspaceAlias(workspaceRegistry, activeRpcCwd) ?? null,
+      workspaceCwd: activeRpcCwd,
       queueLength: messageQueue.length,
       processing: processingWeixin,
       piRunning: rpcClient?.isRunning ?? false,
@@ -610,7 +675,7 @@ async function runDaemon(): Promise<void> {
   /** Pending session selections: userId → sessions array (for /resume flow). */
   const pendingResumeSelections = new Map<
     string,
-    { path: string; label: string }[]
+    { path: string; label: string; workspaceAlias: string }[]
   >();
 
   /** Pending fork selections: userId → fork messages array (for /fork flow). */
@@ -661,9 +726,9 @@ async function runDaemon(): Promise<void> {
   }
 
   /** Scan ~/.pi/agent/sessions/ and return the most recent N sessions. */
-  function listRecentSessions(limit = 10): { path: string; label: string }[] {
+  function listRecentSessions(limit = 10): { path: string; label: string; workspaceAlias: string }[] {
     const sessionsDir = path.join(os.homedir(), ".pi", "agent", "sessions");
-    const entries: { path: string; mtime: number; label: string }[] = [];
+    const entries: { path: string; mtime: number; label: string; workspaceAlias: string }[] = [];
 
     try {
       for (const project of fs.readdirSync(sessionsDir)) {
@@ -686,11 +751,17 @@ async function runDaemon(): Promise<void> {
 
           const title = extractSessionTitle(filePath);
           const displayTitle = title ?? "(无标题)";
+          const sessionCwd = getSessionCwd(filePath);
+          const workspaceAlias = sessionCwd ? findWorkspaceAlias(workspaceRegistry, sessionCwd) : null;
+          // In bot mode historical sessions are restricted to configured roots;
+          // otherwise /resume would bypass the workspace allowlist.
+          if (!workspaceAlias) continue;
 
           entries.push({
             path: filePath,
             mtime: fileStat.mtimeMs,
-            label: `${shortTs}  ${displayTitle}  [${project}]`,
+            label: `${shortTs}  ${displayTitle}  [${workspaceAlias}/${project}]`,
+            workspaceAlias,
           });
         }
       }
@@ -766,7 +837,7 @@ async function runDaemon(): Promise<void> {
 
       // Get cwd from session file (first JSONL event), fallback to daemon cwd
       const sessionFile = s.sessionFile as string | undefined;
-      const cwd = sessionFile ? (getSessionCwd(sessionFile) ?? daemonCwd) : daemonCwd;
+      const cwd = sessionFile ? (getSessionCwd(sessionFile) ?? activeRpcCwd) : activeRpcCwd;
 
       lines.push(`📊 ${modelName} · ${thinking}${msgCount}` + (cwd ? ` · ${cwd}` : ""));
     } else {
@@ -882,6 +953,64 @@ async function runDaemon(): Promise<void> {
           const formatted = formatSessionState(state, stats);
           await sendWeixinReply(api, account, userId, contextToken, sessionId, formatted);
           log(`[slash] /session (user=${userId})`);
+          break;
+        }
+
+        case "workspace": {
+          const parts = cmd.args.split(/\s+/).filter(Boolean);
+          const action = (parts[0] ?? "current").toLowerCase();
+          const currentAlias = selectedWorkspaceAlias(account.id, sessionKey);
+
+          if (action === "current") {
+            const root = workspaceRegistry.roots.get(currentAlias)!;
+            await sendWeixinReply(
+              api, account, userId, contextToken, sessionId,
+              `📁 当前工作区: ${currentAlias}\n${root}`,
+            );
+            break;
+          }
+
+          if (action === "list") {
+            const lines = ["📁 可用工作区："];
+            for (const [alias, root] of workspaceRegistry.roots) {
+              lines.push(`${alias === currentAlias ? "→" : " "} ${alias}: ${root}`);
+            }
+            lines.push("", "使用 /workspace use <别名> 切换");
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, lines.join("\n"));
+            break;
+          }
+
+          const forceNew = action === "new";
+          const alias = (action === "use" || forceNew ? parts[1] : parts[0])?.toLowerCase();
+          if (!alias) {
+            await sendWeixinReply(
+              api, account, userId, contextToken, sessionId,
+              "⚠️ 用法: /workspace [current|list|use <别名>|new <别名>]",
+            );
+            return;
+          }
+          if (!workspaceRegistry.roots.has(alias)) {
+            await sendWeixinReply(
+              api, account, userId, contextToken, sessionId,
+              `⚠️ 未配置工作区: ${alias}\n发送 /workspace list 查看可用别名。`,
+            );
+            return;
+          }
+          if (rpcClient.isStreaming || processingWeixin) {
+            await sendWeixinReply(
+              api, account, userId, contextToken, sessionId,
+              "⏳ 当前任务仍在运行，请等待完成或先发送 /abort。",
+            );
+            return;
+          }
+
+          await activateWorkspace(account, sessionKey, alias, forceNew);
+          const root = workspaceRegistry.roots.get(alias)!;
+          await sendWeixinReply(
+            api, account, userId, contextToken, sessionId,
+            `${forceNew ? "✅ 已在工作区新建 Session" : "✅ 已切换工作区"}: ${alias}\n${root}`,
+          );
+          log(`[workspace] ${forceNew ? "new" : "use"} ${alias} (user=${userId})`);
           break;
         }
 
@@ -1107,9 +1236,10 @@ async function runDaemon(): Promise<void> {
             rpcClient.getSessionStats().catch(() => null),
           ]);
           const formatted = formatSessionState(state, stats);
+          const currentWorkspace = selectedWorkspaceAlias(account.id, sessionKey);
           const queueInfo = `\n\n📬 待处理消息: ${messageQueue.length}` +
             (sessionOwnerKey !== null
-              ? ` | 当前会话: ${sessionOwnerKey === "" ? "默认" : sessionOwnerKey.slice(0, 12)}`
+              ? ` | 工作区: ${currentWorkspace}`
               : "") +
             (messageQueue.length > 0 ? "\n（发送 /queue 查看队列内容）" : "");
           await sendWeixinReply(api, account, userId, contextToken, sessionId, formatted + queueInfo);
@@ -1247,6 +1377,7 @@ async function runDaemon(): Promise<void> {
             "/compact [instructions] — 压缩上下文",
             "/abort — 中止当前任务",
             "/session — 查看 session 状态",
+            "/workspace [current|list|use <别名>|new <别名>] — 查看或切换项目工作区",
             "/status — 查看会话状态 + 队列信息",
             "/queue — 查看正在处理的任务和排队消息内容",
             "/queue-clear — 清空自己排队中的消息",
@@ -1595,9 +1726,13 @@ async function runDaemon(): Promise<void> {
             if (cancelled) {
               await sendWeixinReply(api, account, userId, latestToken, sessionId, "⚠️ Session 切换被取消");
             } else {
+              saveUserWorkspace(account.id, sessionKey, session.workspaceAlias);
+              sessionOwnerKey = routeId(account.id, sessionKey, session.workspaceAlias);
+              const resumedCwd = getSessionCwd(session.path);
+              if (resumedCwd) activeRpcCwd = fs.realpathSync(resumedCwd);
               await sendWeixinReply(
                 api, account, userId, latestToken, sessionId,
-                `✅ 已恢复 session: ${session.label}`,
+                `✅ 已恢复 session: ${session.label}\n📁 工作区: ${session.workspaceAlias}`,
               );
               await persistCurrentSession(account.id, sessionKey);
             }
@@ -1778,6 +1913,19 @@ async function runDaemon(): Promise<void> {
       await ensureSessionFor(qm.account, qm.sessionKey);
     } catch (err) {
       logWarn(`[weixin] 会话切换异常: ${err instanceof Error ? err.message : String(err)}`);
+      await sendWeixinReply(
+        api,
+        qm.account,
+        qm.userId,
+        qm.contextToken,
+        qm.sessionId,
+        `⚠️ 工作区/Session 切换失败，未执行任务。\n${err instanceof Error ? err.message : String(err)}`,
+      );
+      processingWeixin = false;
+      pendingContext = null;
+      sm.setIdle();
+      flushQueue();
+      return;
     }
 
     // ── Auto-compact if the previous turn left the context near full ──
@@ -2386,6 +2534,28 @@ async function runDaemon(): Promise<void> {
    * Bind all RPC event handlers to a (new) RpcClient instance.
    * The "exit" handler triggers the reconnect loop instead of exiting.
    */
+  async function replaceRpcClient(cwd: string): Promise<void> {
+    const canonicalCwd = fs.realpathSync(cwd);
+    const next = new RpcClient(undefined, {
+      persistentSession: config.persistentSession ?? true,
+      cwd: canonicalCwd,
+    });
+    await next.spawn();
+
+    const previous = rpcClient;
+    rpcClient = next;
+    activeRpcCwd = canonicalCwd;
+    bindRpcEvents(next);
+    await applyDefaultModel(next);
+    sessionOwnerKey = null;
+    invalidateVisionCache();
+
+    if (previous && previous !== next && previous.isRunning) {
+      intentionallyStoppedClients.add(previous);
+      previous.kill();
+    }
+  }
+
   function bindRpcEvents(client: RpcClient): void {
     client.on("agent_start", () => {
       log("[rpc] agent_start");
@@ -2559,6 +2729,10 @@ async function runDaemon(): Promise<void> {
     // ── Exit → Auto-Reconnect ──────────────────────────────────────────
     client.on("exit", async (code, signal) => {
       log(`[rpc] Pi 子进程已退出 (code=${code}, signal=${signal})`);
+      if (intentionallyStoppedClients.delete(client) || rpcClient !== client) {
+        log("[rpc] 忽略已替换 RPC 进程的退出事件");
+        return;
+      }
       rpcClient = null;
       await reconnect();
     });
@@ -2627,7 +2801,7 @@ async function runDaemon(): Promise<void> {
       try {
         const newClient = new RpcClient(undefined, {
           persistentSession: config.persistentSession ?? true,
-          cwd: daemonCwd,
+          cwd: activeRpcCwd,
         });
         await newClient.spawn();
         rpcClient = newClient;
@@ -2677,7 +2851,7 @@ async function runDaemon(): Promise<void> {
   try {
     const initialClient = new RpcClient(undefined, {
       persistentSession: config.persistentSession ?? true,
-      cwd: daemonCwd,
+      cwd: activeRpcCwd,
     });
     await initialClient.spawn();
     rpcClient = initialClient;

@@ -14,6 +14,7 @@ import { writeJsonAtomic } from "./storage.js";
 import { sanitizeFileName } from "./media-handler.js";
 import { splitReply, previewText, DEFAULT_MAX_REPLY_LENGTH } from "./format-reply.js";
 import { classifyError } from "./error-classifier.js";
+import { findWorkspaceAlias, isPathInside, resolveWorkspaceRegistry, workspaceSessionKey } from "./workspaces.js";
 
 let passed = 0;
 
@@ -156,6 +157,31 @@ check("classifyError maps the categories we act on", () => {
     assert.ok(c.suggestion.length > 0, `no suggestion for ${msg}`);
     assert.ok(c.emoji.length > 0, `no emoji for ${msg}`);
   }
+});
+
+// ── workspace routing ─────────────────────────────────────────────────
+
+check("workspace registry rejects escapes and picks the most specific root", () => {
+  withTempDir((dir) => {
+    const nested = path.join(dir, "nested");
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "pwh-outside-"));
+    fs.mkdirSync(nested);
+    try {
+      const registry = resolveWorkspaceRegistry({ root: dir, nested }, dir);
+      assert.equal(registry.defaultAlias, "root");
+      assert.equal(findWorkspaceAlias(registry, nested), "nested");
+      assert.equal(findWorkspaceAlias(registry, outside), null);
+      assert.equal(isPathInside(dir, nested), true);
+      assert.equal(isPathInside(dir, outside), false);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+check("workspace session keys isolate aliases", () => {
+  assert.notEqual(workspaceSessionKey("", "pi"), workspaceSessionKey("", "hub"));
+  assert.notEqual(workspaceSessionKey("user", "pi"), workspaceSessionKey("", "pi"));
 });
 
 console.log(`\n${passed} checks passed${process.exitCode ? " (with failures above)" : ""}`);

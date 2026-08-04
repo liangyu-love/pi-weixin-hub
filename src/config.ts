@@ -55,6 +55,8 @@ export interface WeixinConfig {
   schedules?: Record<string, string>;
   /** Pi 会话的工作目录（daemon 启动时 cwd 的替代）。空 = 使用 daemon 启动目录。 */
   workDir?: string;
+  /** 微信 `/workspace` 可切换的工作区别名到绝对目录映射。 */
+  workspaces?: Record<string, string>;
   /** 通知转发策略：all=全部 / errors=仅错误与警告 / none=不转发。默认 errors。 */
   forwardNotifies?: "all" | "errors" | "none";
   /** 本地 webhook 端口（0 = 禁用）；供 Pi 扩展/脚本主动推送消息。 */
@@ -106,6 +108,7 @@ export const DEFAULT_CONFIG: WeixinConfig = {
   requireApproval: true,
   schedules: {},
   workDir: "",
+  workspaces: {},
   forwardNotifies: "errors",
   webhookPort: 0,
   webhookToken: "",
@@ -276,6 +279,28 @@ export function setConfigValue(
       return null;
     }
 
+    case "workspaces": {
+      try {
+        const parsed = JSON.parse(rawValue);
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return `workspaces 必须是 JSON 对象，如 {"pi":"C:\\\\Users\\\\me\\\\project"}`;
+        }
+        for (const [alias, dir] of Object.entries(parsed)) {
+          if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,31}$/.test(alias)) {
+            return `无效工作区别名 "${alias}"`;
+          }
+          if (typeof dir !== "string" || !dir.trim() || !fs.existsSync(dir)) {
+            return `工作区目录不存在: ${String(dir)}`;
+          }
+          if (!fs.statSync(dir).isDirectory()) return `工作区路径不是目录: ${dir}`;
+        }
+        config.workspaces = parsed as Record<string, string>;
+        return null;
+      } catch (err) {
+        return `workspaces 必须是有效 JSON 对象: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+
     case "forwardNotifies": {
       const v = rawValue.toLowerCase();
       if (!["all", "errors", "none"].includes(v)) {
@@ -406,6 +431,12 @@ export function describeConfig(config: WeixinConfig): string {
       : "(无)",
   );
   label("workDir", config.workDir ?? "(daemon 启动目录)");
+  label(
+    "workspaces",
+    config.workspaces && Object.keys(config.workspaces).length > 0
+      ? Object.entries(config.workspaces).map(([alias, dir]) => `${alias}=${dir}`).join(" · ")
+      : "(仅默认工作区)",
+  );
   label(
     "forwardNotifies",
     config.forwardNotifies === "all" ? "全部转发" : config.forwardNotifies === "none" ? "不转发" : "仅错误/警告",

@@ -149,6 +149,7 @@ Weixin Backend (ilinkai.weixin.qq.com)
 | `/compact [instructions]` | 压缩上下文（可附加压缩说明） |
 | `/abort` | 中止当前 agent 运行 |
 | `/session` | 显示当前 session 状态（模型、token 等） |
+| `/workspace [current\|list\|use <别名>\|new <别名>]` | 查看或切换允许的项目工作区 |
 | `/messages` | 查看最近 20 条对话消息 |
 | `/export [path]` | 导出 session 为 HTML |
 | `/model [name]` | 切换模型：带参数直接按名称/ID 切换，无参数列出可选模型 |
@@ -330,6 +331,7 @@ pi-weixin-cli 支持接收微信视频消息：
 | `userModels` | object | `{}` | 每用户模型映射 `{ "userId": "provider/modelId" }` |
 | `requireApproval` | boolean | `true` | 讨论优先：默认禁止自主执行工具/改文件，执行需用户明确同意 |
 | `schedules` | object | `{}` | 定时任务 `{ "8:00": "早安", "every:30": "push:提醒" }` |
+| `workspaces` | object | `{}` | 微信可切换的工作区别名到绝对目录映射；未配置的目录会被拒绝 |
 | `groupChat` | boolean | `false` | 是否响应群聊消息 |
 | `botName` | string | `""` | 群聊触发昵称（消息需含 `@botName`；空 = 处理所有群消息） |
 | `maxReplyLength` | number | `2000` | 单条回复最大字符数，超过自动拆分（`0` = 不拆分） |
