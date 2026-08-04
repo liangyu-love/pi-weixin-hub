@@ -17,6 +17,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { writeJsonAtomic } from "./storage.js";
 
 export interface WeixinConfig {
   /** 是否启用消息接收（daemon 启动时读取）。CLI 模式下通过 `toggle` 命令切换。 */
@@ -142,9 +143,8 @@ export function loadConfig(): WeixinConfig {
 }
 
 export function saveConfig(config: WeixinConfig): void {
-  const filePath = getConfigPath();
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(config, null, 2), "utf-8");
+  // settings.json holds webhookToken — atomic write, owner-only.
+  writeJsonAtomic(getConfigPath(), config);
 }
 
 /** 恢复默认配置并持久化。 */

@@ -39,7 +39,7 @@ import { loadAccounts, saveContextToken, loadContextTokens, loadUserSession, sav
 import { loadConfig, saveConfig } from "./config.js";
 import { startWebhookServer, type WebhookServer } from "./webhook.js";
 import { Logger, resolveLogLevel, setLogFile } from "./logger.js";
-import { formatAndSplit } from "./format-reply.js";
+import { formatAndSplit, previewText } from "./format-reply.js";
 import { classifyError, formatClassifiedError } from "./error-classifier.js";
 import { buildContextPrefix, enrichMessageText, memoryFilePath, readMemoryFile } from "./context.js";
 import type { WeixinAccount, WeixinMessage, ImageItem, FileItem, VoiceItem, VideoItem } from "./types.js";
@@ -60,6 +60,16 @@ interface PendingContext {
   sessionId: string;
   /** Session routing key ("" = default/private, otherwise a from_user_id). */
   sessionKey: string;
+  /** First 60 chars of the user message being processed (for queue visibility). */
+  textPreview?: string;
+  /** When this turn started (ms) — shown as elapsed time in /queue. */
+  startedAt?: number;
+  /**
+   * True when other messages were waiting as this turn began. Replies then
+   * get tagged with the question they answer, so a user who re-sent while
+   * waiting can tell which request produced which reply.
+   */
+  needsAttribution?: boolean;
 }
 
 // ── Message Queue Entry ────────────────────────────────────────────────
@@ -174,6 +184,11 @@ function logDebug(msg: string): void {
 /** Warn-level log. */
 function logWarn(msg: string): void {
   logger.warn(msg);
+}
+
+/** Error-level log. */
+function logError(msg: string): void {
+  logger.error(msg);
 }
 
 // ── Slash Command Type ─────────────────────────────────────────────────
@@ -517,6 +532,21 @@ async function runDaemon(): Promise<void> {
     const next = messageQueue.shift();
     persistQueueNow();
     return next;
+  }
+
+  /**
+   * Drop this user's queued messages and persist. Returns how many were
+   * removed. Other users' entries are left alone — one person clearing their
+   * own backlog must not silently discard someone else's pending request.
+   */
+  function clearQueue(userId: string): number {
+    const before = messageQueue.length;
+    const kept = messageQueue.filter((m) => m.userId !== userId);
+    messageQueue.length = 0;
+    messageQueue.push(...kept);
+    const dropped = before - messageQueue.length;
+    if (dropped > 0) persistQueueNow();
+    return dropped;
   }
 
   /** Load persisted messages from a previous run (TTL-filtered). */
@@ -1080,9 +1110,27 @@ async function runDaemon(): Promise<void> {
           const queueInfo = `\n\n📬 待处理消息: ${messageQueue.length}` +
             (sessionOwnerKey !== null
               ? ` | 当前会话: ${sessionOwnerKey === "" ? "默认" : sessionOwnerKey.slice(0, 12)}`
-              : "");
+              : "") +
+            (messageQueue.length > 0 ? "\n（发送 /queue 查看队列内容）" : "");
           await sendWeixinReply(api, account, userId, contextToken, sessionId, formatted + queueInfo);
           log(`[slash] /status (user=${userId})`);
+          break;
+        }
+
+        case "queue": {
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, renderQueue(userId));
+          log(`[slash] /queue (user=${userId})`);
+          break;
+        }
+
+        case "queue-clear": {
+          const dropped = clearQueue(userId);
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            dropped === 0
+              ? "📭 队列本来就是空的。"
+              : `🗑️ 已清空 ${dropped} 条排队消息（正在处理的任务不受影响，用 /abort 中止它）。`,
+          );
+          log(`[slash] /queue-clear → ${dropped} 条 (user=${userId})`);
           break;
         }
 
@@ -1200,6 +1248,8 @@ async function runDaemon(): Promise<void> {
             "/abort — 中止当前任务",
             "/session — 查看 session 状态",
             "/status — 查看会话状态 + 队列信息",
+            "/queue — 查看正在处理的任务和排队消息内容",
+            "/queue-clear — 清空自己排队中的消息",
             "/usage — 查看用量统计（token/费用）",
             "/messages — 查看对话消息",
             "/export [path] — 导出 session 为 HTML",
@@ -1327,6 +1377,20 @@ async function runDaemon(): Promise<void> {
     if (max <= 0) return false;
     const now = Date.now();
     const windowMs = 60_000;
+
+    // Both maps are keyed by userId and would otherwise grow forever (one slot
+    // per stranger who ever messaged the bot). Entries older than the window
+    // carry no information, so drop them whenever the maps get large.
+    // ponytail: swept inline instead of on a timer — fine at bot scale.
+    if (rateBuckets.size > 1000 || rateLimitedNotifiedAt.size > 1000) {
+      for (const [id, b] of rateBuckets) {
+        if (now - b.windowStart >= windowMs) rateBuckets.delete(id);
+      }
+      for (const [id, at] of rateLimitedNotifiedAt) {
+        if (now - at >= windowMs) rateLimitedNotifiedAt.delete(id);
+      }
+    }
+
     const bucket = rateBuckets.get(userId);
     if (!bucket || now - bucket.windowStart >= windowMs) {
       rateBuckets.set(userId, { count: 1, windowStart: now });
@@ -1675,8 +1739,11 @@ async function runDaemon(): Promise<void> {
       });
       // Let the user know their message is queued (first one per busy period)
       if (wasQueueEmpty) {
+        const running = pendingContext?.textPreview
+          ? `正在处理「${previewText(pendingContext.textPreview, 24)}」`
+          : "上一条消息还在处理中";
         sendWeixinReply(api, account, userId, latestToken, sessionId,
-          "⏳ 前一条消息还在处理中，你的消息已排队，完成后会回复。",
+          `⏳ ${running}\n你的消息已排队（第 ${messageQueue.length} 位），完成后会自动回复。\n发送 /queue 查看队列，/abort 中止当前任务。`,
         ).catch(() => {});
       }
     }
@@ -1699,6 +1766,11 @@ async function runDaemon(): Promise<void> {
       contextToken: qm.contextToken,
       sessionId: qm.sessionId,
       sessionKey: qm.sessionKey,
+      textPreview: qm.text.slice(0, 60),
+      startedAt: Date.now(),
+      // Only worth the extra line when replies could actually be confused:
+      // this message waited in the queue, or others are still waiting.
+      needsAttribution: messageQueue.length > 0 || qm.createdAt !== undefined,
     };
 
     // ── Ensure the correct per-user session is active before prompting ──
@@ -1907,6 +1979,52 @@ async function runDaemon(): Promise<void> {
     const fileInfo = qm.fileItem ? ` + 文件: ${qm.fileItem.file_name ?? "unknown"}` : "";
     log(`[weixin] 发送 prompt: ${summary}${messageText.length > 60 ? "..." : ""}${imagePath ? ` + 图片: ${imagePath}` : ""}${voicePath ? ` + 语音: ${voicePath}` : ""}${videoPath ? ` + 视频: ${videoPath}` : ""}${fileInfo}`);
     rpcClient.sendPrompt(messageText, imageContents ?? undefined);
+  }
+
+  /**
+   * Render the running task and the pending queue for a WeChat reply.
+   *
+   * Users could previously only see a queue *count*, so when a slow turn made
+   * them re-send, they had no way to tell which request was stuck or whether
+   * their duplicate had also been queued. Entries the asking user sent are
+   * marked so they can identify their own.
+   */
+  function renderQueue(askerId: string): string {
+    const lines: string[] = [];
+
+    if (pendingContext) {
+      const who = pendingContext.userId === askerId ? "你" : shortId(pendingContext.userId);
+      const elapsed = pendingContext.startedAt
+        ? `，已运行 ${Math.round((Date.now() - pendingContext.startedAt) / 1000)}s`
+        : "";
+      lines.push(`▶️ 正在处理（${who}${elapsed}）`);
+      lines.push(`   「${previewText(pendingContext.textPreview ?? "", 40)}」`);
+    } else {
+      lines.push("💤 当前空闲，没有正在处理的任务");
+    }
+
+    if (messageQueue.length === 0) {
+      lines.push("", "📭 队列为空");
+    } else {
+      lines.push("", `📬 队列中 ${messageQueue.length} 条：`);
+      const shown = messageQueue.slice(0, 10);
+      shown.forEach((m, i) => {
+        const who = m.userId === askerId ? "你" : shortId(m.userId);
+        const waited = m.createdAt ? `，等待 ${Math.round((Date.now() - m.createdAt) / 1000)}s` : "";
+        lines.push(`${i + 1}. ${who}${waited}：「${previewText(m.text, 30)}」`);
+      });
+      if (messageQueue.length > shown.length) {
+        lines.push(`… 另有 ${messageQueue.length - shown.length} 条`);
+      }
+      lines.push("", "💡 /abort 中止当前任务 | /queue-clear 清空队列");
+    }
+
+    return lines.join("\n");
+  }
+
+  /** Short, readable form of a WeChat user id for queue listings. */
+  function shortId(userId: string): string {
+    return userId ? `用户 ${userId.slice(0, 8)}` : "未知用户";
   }
 
   /**
@@ -2215,7 +2333,13 @@ async function runDaemon(): Promise<void> {
         }
       } else if (reply) {
         // ── Format + split long replies, apply status prefix ────────
-        const chunks = formatAndSplit(reply, config.maxReplyLength ?? 2000);
+        // When the turn was queued behind others, lead with the question this
+        // reply belongs to — otherwise a user who re-sent while waiting gets
+        // two answers with no way to tell which is which.
+        const attribution = ctx.needsAttribution && ctx.textPreview
+          ? `↩️ 回复「${previewText(ctx.textPreview, 30)}」\n\n`
+          : "";
+        const chunks = formatAndSplit(attribution + reply, config.maxReplyLength ?? 2000);
         const prefix = config.replyPrefix ?? "";
         for (const chunk of chunks) {
           await sendWeixinReply(
@@ -2813,7 +2937,8 @@ async function runDaemon(): Promise<void> {
     const schedules = config.schedules ?? {};
     const now = new Date();
     const nowMs = Date.now();
-    const today = `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`;
+    const pad2 = (n: number) => String(n).padStart(2, "0");
+    const today = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
 
     for (const [key, message] of Object.entries(schedules)) {
       const spec = parseScheduleKey(key);
@@ -2866,6 +2991,25 @@ async function runDaemon(): Promise<void> {
 
 // ── Entry ──────────────────────────────────────────────────────────────
 
+/**
+ * Keep the daemon alive through stray async faults.
+ *
+ * A long-running bridge touches the network, a subprocess and the filesystem
+ * on every turn; a single missed `.catch()` anywhere in that would otherwise
+ * take the whole daemon down and silently stop delivering messages. Log and
+ * carry on instead — the RPC reconnect and queue recovery paths already know
+ * how to pick things back up.
+ */
+function installGlobalErrorHandlers(): void {
+  process.on("unhandledRejection", (reason) => {
+    const msg = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+    logError(`[fatal] 未处理的 Promise 拒绝（已忽略，daemon 继续运行）: ${msg}`);
+  });
+  process.on("uncaughtException", (err) => {
+    logError(`[fatal] 未捕获异常（已忽略，daemon 继续运行）: ${err.stack ?? err.message}`);
+  });
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
@@ -2892,6 +3036,9 @@ async function main(): Promise<void> {
   }
 
   if (args.length === 0 || args[0] === "daemon") {
+    // Only the long-running daemon survives stray faults; CLI commands should
+    // still fail loudly so scripts can see a non-zero exit.
+    installGlobalErrorHandlers();
     await runDaemon();
   } else {
     const exitCode = await runCLI(args);

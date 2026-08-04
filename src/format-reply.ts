@@ -118,32 +118,39 @@ export function splitReply(text: string, maxLength: number): string[] {
   if (maxLength <= 0) return [text];
   if (text.length <= maxLength) return [text];
 
+  // The "（续 n/m）\n" label is prepended after splitting, so the payload
+  // budget has to leave room for it — otherwise a maxLength-sized chunk plus
+  // its label overflows the limit we were asked to respect.
+  const LABEL_BUDGET = 16;
+  const budget = maxLength > LABEL_BUDGET * 2 ? maxLength - LABEL_BUDGET : maxLength;
+
   const chunks: string[] = [];
   let remaining = text;
 
-  while (remaining.length > maxLength) {
+  while (remaining.length > budget) {
     // Find the last newline within the limit.
-    const slice = remaining.slice(0, maxLength + 1);
+    const slice = remaining.slice(0, budget + 1);
     const newlineIdx = slice.lastIndexOf("\n");
 
     let splitAt = newlineIdx;
     if (splitAt <= 0) {
       // No newline in range — prefer the last space before the limit.
       const spaceIdx = slice.lastIndexOf(" ");
-      splitAt = spaceIdx > maxLength * 0.5 ? spaceIdx : -1;
+      splitAt = spaceIdx > budget * 0.5 ? spaceIdx : -1;
     }
 
     if (splitAt <= 0) {
       // Hard wrap: prefer the next space within a bounded lookahead so
-      // long URLs / words aren't split mid-token. Bounded at +30% length.
+      // long URLs / words aren't split mid-token. Bounded to what is left in
+      // the budget so a lookahead can never push a chunk over the limit.
       const lookaheadLen = Math.min(
-        Math.floor(maxLength * 0.3) + 1,
-        remaining.length - maxLength,
+        Math.max(0, maxLength - budget),
+        remaining.length - budget,
       );
       const nextSpace = remaining
-        .slice(maxLength, maxLength + lookaheadLen)
+        .slice(budget, budget + lookaheadLen)
         .indexOf(" ");
-      splitAt = nextSpace !== -1 ? maxLength + nextSpace : maxLength;
+      splitAt = nextSpace !== -1 ? budget + nextSpace : budget;
 
       // Never split a UTF-16 surrogate pair (emoji / astral chars).
       if (splitAt > 0 && splitAt < remaining.length) {
@@ -151,7 +158,7 @@ export function splitReply(text: string, maxLength: number): string[] {
         if (code >= 0xdc00 && code <= 0xdfff) splitAt -= 1;
       }
     }
-    if (splitAt <= 0) splitAt = maxLength;
+    if (splitAt <= 0) splitAt = budget;
 
     chunks.push(remaining.slice(0, splitAt));
     remaining = remaining.slice(splitAt).replace(/^\n+/, "");
@@ -167,6 +174,21 @@ export function splitReply(text: string, maxLength: number): string[] {
     );
   }
   return chunks;
+}
+
+// ── Previews ───────────────────────────────────────────────────────────
+
+/**
+ * Condense a message into a one-line label for queue listings.
+ *
+ * Whitespace collapses to single spaces (a multi-line paste must not blow up
+ * the /queue reply) and the result is ellipsized, so users can still recognise
+ * which of their own messages an entry refers to.
+ */
+export function previewText(text: string, maxLen = 40): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (flat.length === 0) return "(空消息)";
+  return flat.length <= maxLen ? flat : `${flat.slice(0, maxLen - 1)}…`;
 }
 
 // ── Convenience ────────────────────────────────────────────────────────

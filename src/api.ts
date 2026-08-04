@@ -251,10 +251,13 @@ export class WeixinApi {
         throw new Error(`HTTP ${resp.status} ${resp.statusText}: ${rawText.slice(0, 300)}`);
       }
       const parsed = JSON.parse(rawText) as SendMessageResp;
-      // Attach raw for diagnostics
-      (parsed as any).__status = resp.status;
-      (parsed as any).__raw = rawText;
-      (parsed as any).__reqBody = JSON.stringify(body);
+      // Attach raw for diagnostics — only on a non-OK ret. The request body
+      // carries context_token, so it must not ride along on success paths
+      // where the whole object may end up in a log line.
+      if (parsed.ret !== undefined && parsed.ret !== 0) {
+        (parsed as any).__status = resp.status;
+        (parsed as any).__raw = rawText;
+      }
       return parsed;
     } finally {
       clearTimeout(timer);
@@ -319,7 +322,9 @@ export class WeixinApi {
         throw new Error(`HTTP ${resp.status} ${resp.statusText}: ${rawText.slice(0, 300)}`);
       }
       const parsed = JSON.parse(rawText) as { ret?: number };
-      (parsed as any).__raw = rawText;
+      if (parsed.ret !== undefined && parsed.ret !== 0) {
+        (parsed as any).__raw = rawText;
+      }
       return parsed;
     } finally {
       clearTimeout(timer);

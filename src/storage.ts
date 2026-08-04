@@ -16,6 +16,20 @@ function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
 }
 
+/**
+ * Write JSON atomically with owner-only permissions.
+ *
+ * Writes to `<file>.tmp` then renames: a crash mid-write leaves the previous
+ * (valid) file intact instead of a truncated one. Mode 0o600 because several
+ * of these files hold credentials (botToken, context tokens).
+ */
+export function writeJsonAtomic(filePath: string, value: unknown): void {
+  ensureDir(path.dirname(filePath));
+  const tmp = `${filePath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { encoding: "utf-8", mode: 0o600 });
+  fs.renameSync(tmp, filePath);
+}
+
 /** Sanitize an ID for use as a filename. */
 function safeId(id: string): string {
   return id.replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -45,13 +59,7 @@ export function loadAccounts(): WeixinAccount[] {
 }
 
 function saveAccounts(accounts: WeixinAccount[]): void {
-  const dir = getStateDir();
-  ensureDir(dir);
-  fs.writeFileSync(
-    path.join(dir, ACCOUNTS_FILE),
-    JSON.stringify(accounts, null, 2),
-    "utf-8",
-  );
+  writeJsonAtomic(path.join(getStateDir(), ACCOUNTS_FILE), accounts);
 }
 
 /** Add or update an account. */
@@ -103,9 +111,7 @@ export function loadSyncState(accountId: string): WeixinSyncState {
 
 /** Save sync state for an account. */
 export function saveSyncState(accountId: string, state: WeixinSyncState): void {
-  const filePath = syncStatePath(accountId);
-  ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, JSON.stringify(state, null, 2), "utf-8");
+  writeJsonAtomic(syncStatePath(accountId), state);
 }
 
 /** Update just the getUpdatesBuf cursor for an account. */
@@ -138,9 +144,7 @@ function legacySessionPath(accountId: string): string {
 }
 
 function saveSessionMap(accountId: string, map: Record<string, string>): void {
-  const filePath = sessionMapPath(accountId);
-  ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, JSON.stringify(map, null, 2), "utf-8");
+  writeJsonAtomic(sessionMapPath(accountId), map);
 }
 
 /**
@@ -265,9 +269,7 @@ export function addUsage(
   entry.turns += 1;
   map[sessionKey] = entry;
   try {
-    const filePath = usagePath(accountId);
-    ensureDir(path.dirname(filePath));
-    fs.writeFileSync(filePath, JSON.stringify(map, null, 2), "utf-8");
+    writeJsonAtomic(usagePath(accountId), map);
   } catch {
     /* ignore */
   }
@@ -307,9 +309,7 @@ export function saveContextToken(
 ): void {
   const tokens = loadContextTokens(accountId);
   tokens[userId] = token;
-  const filePath = contextTokenPath(accountId);
-  ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, JSON.stringify(tokens, null, 2), "utf-8");
+  writeJsonAtomic(contextTokenPath(accountId), tokens);
 }
 
 /** Delete all context tokens for an account. */

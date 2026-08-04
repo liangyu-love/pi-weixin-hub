@@ -130,6 +130,13 @@ export function resolvePiTarget(piPath?: string): ResolvedTarget {
 /** Max accumulated stderr bytes to retain for diagnostics. */
 const MAX_STDERR_BYTES = 64 * 1024;
 
+/**
+ * Max bytes to hold while waiting for a newline on stdout. A single RPC event
+ * carrying a full agent transcript can be large, so this is generous — but it
+ * is bounded: a stream with no newline at all must not grow until OOM.
+ */
+const MAX_STDOUT_LINE_BYTES = 32 * 1024 * 1024;
+
 // ── Spawn options ────────────────────────────────────────────────────────
 
 /** Options controlling how the Pi RPC subprocess is spawned. */
@@ -561,6 +568,18 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
    */
   private onStdoutData(chunk: Buffer): void {
     this.buffer = Buffer.concat([this.buffer, chunk]);
+
+    // Guard: no newline within the cap means the stream is not JSONL (or the
+    // producer is stuck). Drop the partial line instead of growing until OOM.
+    if (this.buffer.length > MAX_STDOUT_LINE_BYTES && this.buffer.indexOf(0x0a) === -1) {
+      const dropped = this.buffer.length;
+      this.buffer = Buffer.alloc(0);
+      this.emit(
+        "error",
+        new Error(`RpcClient: dropped ${dropped} bytes of stdout with no newline (line cap exceeded)`),
+      );
+      return;
+    }
 
     let newlineIdx: number;
     while ((newlineIdx = this.buffer.indexOf(0x0a)) !== -1) {

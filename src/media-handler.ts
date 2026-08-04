@@ -452,8 +452,11 @@ export async function saveVoiceLocally(voice: VoiceItem): Promise<string | null>
     const encryptType = voice.media?.encrypt_type;
     let decrypted = await decryptIfNeeded(buffer, aesKey, encryptType);
 
-    // Fallback: try encrypt_query_param
-    if (!isValidImageBuffer(decrypted)) {
+    // Fallback: re-fetch via encrypt_query_param only when local decryption
+    // clearly produced nothing usable. (This used to call isValidImageBuffer,
+    // which can never match .silk audio — so the fallback fired on every
+    // voice message and downloaded the file twice.)
+    if (!looksDecrypted(decrypted, buffer, aesKey)) {
       const encryptQuery = voice.media?.encrypt_query_param;
       if (encryptQuery) {
         try {
@@ -534,8 +537,12 @@ export async function saveVideoLocally(video: VideoItem): Promise<string | null>
     const encryptType = video.media?.encrypt_type;
     let decrypted = await decryptIfNeeded(buffer, aesKey, encryptType);
 
-    // Fallback: try encrypt_query_param
-    const encryptQuery = video.media?.encrypt_query_param;
+    // Fallback: re-fetch via encrypt_query_param only when local decryption
+    // failed. Previously this ran unconditionally, downloading every video
+    // twice and throwing away the first (usually correct) copy.
+    const encryptQuery = looksDecrypted(decrypted, buffer, aesKey)
+      ? undefined
+      : video.media?.encrypt_query_param;
     if (encryptQuery) {
       try {
         let altUrl = fullUrl;
@@ -582,9 +589,11 @@ export async function saveFileLocally(file: FileItem): Promise<string | null> {
 
   ensureFileStorageDir();
 
-  // Sanitize filename: remove path separators and replace unsafe chars
+  // Sanitize filename. The name is attacker-controlled (it comes from the
+  // WeChat message), so strip directory components first — a char-class
+  // replace alone still lets "..", "..%5C.." and friends escape the dir.
   const rawName = file.file_name ?? "unknown";
-  const safeName = rawName.replace(/[\\/:*?"<>|]/g, "_");
+  const safeName = sanitizeFileName(rawName);
 
   // Build filename: timestamp_safeName
   const timestamp = new Date().toISOString()
@@ -624,8 +633,15 @@ export async function saveFileLocally(file: FileItem): Promise<string | null> {
       const encryptQuery = file.media?.encrypt_query_param;
       if (encryptQuery) {
         try {
-          const sep = fullUrl.includes("?") ? "&" : "?";
-          const altUrl = fullUrl + sep + encryptQuery;
+          // encrypt_query_param is a value, not a full "k=v" pair — the voice
+          // and video paths above already treat it that way.
+          let altUrl = fullUrl;
+          if (altUrl.includes("encrypted_query_param=")) {
+            altUrl = altUrl.replace(/encrypted_query_param=[^&]*/, `encrypted_query_param=${encodeURIComponent(encryptQuery)}`);
+          } else {
+            const sep = altUrl.includes("?") ? "&" : "?";
+            altUrl = altUrl + sep + "encrypted_query_param=" + encodeURIComponent(encryptQuery);
+          }
           const altController = new AbortController();
           const altTimer = setTimeout(() => altController.abort(), DOWNLOAD_TIMEOUT_MS);
           const altResp = await fetch(altUrl, {
@@ -657,6 +673,35 @@ export async function saveFileLocally(file: FileItem): Promise<string | null> {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Whether `decrypted` is usable, for media types we cannot magic-byte check.
+ *
+ * `decryptIfNeeded` returns the *same* buffer object when it has nothing to do
+ * (no key) or when decryption failed. So: no key means the payload was never
+ * encrypted and is fine as-is; a key plus an unchanged buffer means decryption
+ * failed and the caller should try the encrypt_query_param re-fetch.
+ */
+function looksDecrypted(decrypted: Buffer, original: Buffer, aesKey?: string): boolean {
+  if (!aesKey) return true;
+  return decrypted !== original;
+}
+
+/**
+ * Reduce a remote-supplied file name to a safe basename.
+ *
+ * Handles both separators (the name may arrive with Windows or POSIX slashes
+ * regardless of our platform), strips leading dots so "..", "." and hidden
+ * traversal payloads cannot survive, and falls back to "unnamed".
+ */
+export function sanitizeFileName(rawName: string): string {
+  const base = rawName.split(/[\\/]/).pop() ?? "";
+  const cleaned = base
+    .replace(/[\x00-\x1f:*?"<>|]/g, "_")
+    .replace(/^\.+/, "")
+    .trim();
+  return cleaned.length > 0 ? cleaned.slice(0, 120) : "unnamed";
+}
 
 /**
  * Check if a buffer starts with a known image magic number.

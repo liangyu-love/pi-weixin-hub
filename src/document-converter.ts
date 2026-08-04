@@ -79,6 +79,15 @@ async function findPython(): Promise<string> {
   throw new Error("未找到可用的 Python（需要 Python 3.10+）");
 }
 
+/**
+ * Max chars kept from markitdown's stdout. Well above any maxChars we send to
+ * Pi, but bounded: a runaway converter must not grow the heap until OOM.
+ */
+const MAX_STDOUT_CHARS = 8 * 1024 * 1024;
+
+/** Max chars of stderr kept for the error message. */
+const MAX_STDERR_CHARS = 64 * 1024;
+
 function runMarkItDown(python: string, filePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(python, ["-m", "markitdown", filePath], {
@@ -87,16 +96,40 @@ function runMarkItDown(python: string, filePath: string): Promise<string> {
     });
     let stdout = "";
     let stderr = "";
+    let stdoutCapped = false;
+    let timedOut = false;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (d) => { stdout += d; });
-    child.stderr.on("data", (d) => { stderr += d; });
-    const timer = setTimeout(() => child.kill(), CONVERT_TIMEOUT_MS);
+    child.stdout.on("data", (d: string) => {
+      if (stdout.length >= MAX_STDOUT_CHARS) {
+        stdoutCapped = true;
+        return;
+      }
+      stdout += d;
+      if (stdout.length > MAX_STDOUT_CHARS) {
+        stdout = stdout.slice(0, MAX_STDOUT_CHARS);
+        stdoutCapped = true;
+      }
+    });
+    child.stderr.on("data", (d: string) => {
+      if (stderr.length >= MAX_STDERR_CHARS) return;
+      stderr = (stderr + d).slice(0, MAX_STDERR_CHARS);
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+      // If SIGTERM is ignored, escalate so we never leak the process.
+      setTimeout(() => { if (child.exitCode === null) child.kill("SIGKILL"); }, 2_000).unref();
+    }, CONVERT_TIMEOUT_MS);
     child.on("error", (err) => { clearTimeout(timer); reject(new Error(`启动转换进程失败: ${err.message}`)); });
     child.on("exit", (code) => {
       clearTimeout(timer);
-      if (code === 0) resolve(stdout);
-      else {
+      if (timedOut) {
+        reject(new Error(`markitdown 转换超时 (${CONVERT_TIMEOUT_MS / 1000}s)`));
+      } else if (code === 0) {
+        if (stdoutCapped) logger.warn(`转换输出超过 ${MAX_STDOUT_CHARS} 字符上限，已截断: ${filePath}`);
+        resolve(stdout);
+      } else {
         const tail = stderr.trim().split("\n").slice(-3).join("\n");
         reject(new Error(`markitdown 转换失败 (exit ${code}): ${tail || "未知错误"}`));
       }

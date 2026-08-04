@@ -28,7 +28,8 @@
     "build": "tsc",
     "postbuild": "chmod +x dist/main.js",
     "prepack": "npm run build",
-    "start": "node dist/main.js"
+    "start": "node dist/main.js",
+    "check": "tsc && node dist/selfcheck.js"
   },
   "repository": {
     "type": "git",
