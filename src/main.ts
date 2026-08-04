@@ -2660,6 +2660,17 @@ async function runDaemon(): Promise<void> {
     return { ok: true };
   }
 
+  /** Restart the pi subprocess: killing it triggers the reconnect loop,
+   *  which spawns a fresh pi that loads new/changed extensions. */
+  async function restartPiProcess(): Promise<{ ok: boolean; error?: string }> {
+    if (!rpcClient) {
+      return { ok: false, error: "pi 未运行" };
+    }
+    log("[webhook] 收到 /restart，重启 pi 进程（新进程将加载最新扩展）...");
+    rpcClient.kill();
+    return { ok: true };
+  }
+
   const webhookPort = config.webhookPort ?? 0;
   if (webhookPort > 0) {
     try {
@@ -2673,6 +2684,7 @@ async function runDaemon(): Promise<void> {
           sendText: (user, text) => sendWebhookText(user, text, false),
           sendNotify: (user, text) => sendWebhookText(user, text, true),
           sendMedia: (user, media) => sendWebhookMedia(user, media),
+          restart: () => restartPiProcess(),
         },
         webhookPort,
       );

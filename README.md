@@ -382,6 +382,7 @@ pi-weixin-hub daemon
 | `POST /send` | `{ user?, text }` | 格式化文本推送（带回复前缀） |
 | `POST /notify` | `{ user?, text }` | 信息推送（⚡ 前缀） |
 | `POST /media` | `{ user?, url, type?, caption? }` | 图片/文件推送 |
+| `POST /restart` | `{}` | 重启 pi 子进程（加载最新扩展） |
 
 `user` 省略时发给最近发过消息的用户；`user` 指定时按已保存的 context token 定位。
 

@@ -22,6 +22,8 @@ export interface WebhookHandlers {
     user: string,
     media: { type?: string; url: string; caption?: string },
   ) => Promise<{ ok: boolean; error?: string }>;
+  /** Restart the pi subprocess (fresh process loads new/changed extensions). */
+  restart: () => Promise<{ ok: boolean; error?: string }>;
 }
 
 export interface WebhookServer {
@@ -132,6 +134,10 @@ export function startWebhookServer(
               url,
               caption: typeof payload.caption === "string" ? payload.caption : undefined,
             });
+            break;
+          }
+          case "/restart": {
+            result = await handlers.restart();
             break;
           }
           default:
